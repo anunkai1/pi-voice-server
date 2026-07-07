@@ -1,0 +1,13 @@
+{
+  "name": "pi-voice-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal Kokoro TTS HTTP server (adapted from @s1m0n38/pi-voice, MIT)",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "kokoro-js": "^1.2.1"
+  }
+}

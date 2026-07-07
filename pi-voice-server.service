@@ -1,0 +1,22 @@
+[Unit]
+Description=Kokoro TTS HTTP server (pi-voice-server) for agentchatbox /api/tts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=lepton
+Type=simple
+WorkingDirectory=/home/lepton/pi-voice-server
+ExecStart=/usr/bin/node /home/lepton/pi-voice-server/server.mjs
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/home/lepton
+Environment=KOKORO_HOST=127.0.0.1
+Environment=KOKORO_PORT=8181
+Environment=KOKORO_DTYPE=q4
+Environment=KOKORO_VOICE=af_heart
+
+[Install]
+WantedBy=default.target
