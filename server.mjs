@@ -91,12 +91,38 @@ function float32ToWav(samples, sampleRate) {
 	return buf;
 }
 
+// 2 MB hard cap on any single request body. TTS text is tiny (the
+// agentchatbox proxy caps at 30 000 chars; kidstories sends a page at a
+// time), so this only ever trips on misuse/abuse — but without it a single
+// oversized POST would accumulate unbounded chunks and OOM the warm-model
+// process (a cold reload is ~600 ms + ~291 MB).
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
+
 function readBody(req) {
 	return new Promise((resolveP, rejectP) => {
 		const chunks = [];
-		req.on("data", (c) => chunks.push(c));
-		req.on("end", () => resolveP(Buffer.concat(chunks).toString("utf-8")));
-		req.on("error", rejectP);
+		let size = 0;
+		let aborted = false;
+		req.on("data", (c) => {
+			if (aborted) return;
+			size += c.length;
+			if (size > MAX_BODY_BYTES) {
+				// Stop ingesting, tear down the socket, and reject. The handler's
+				// catch turns this into a 500 with a clear message. Destroying is
+				// intentional: we don't want to buffer the rest of a runaway body.
+				aborted = true;
+				req.destroy();
+				rejectP(new Error(`request body too large (max ${MAX_BODY_BYTES} bytes)`));
+				return;
+			}
+			chunks.push(c);
+		});
+		req.on("end", () => {
+			if (!aborted) resolveP(Buffer.concat(chunks).toString("utf-8"));
+		});
+		req.on("error", (e) => {
+			if (!aborted) rejectP(e);
+		});
 	});
 }
 
