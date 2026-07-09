@@ -99,10 +99,8 @@ sudo systemctl enable --now pi-voice-server
 
 ## Files
 
-- **`server.mjs`** — the server systemd actually runs. This is the source of truth.
-- `server.ts` — an older, undeployed TypeScript rewrite with extra model-management
-  endpoints (`/models/*`). Kept for reference; the systemd unit does **not** run it.
-- `test-kokoro.mjs` — throwaway synthesis smoke test.
+- **`server.mjs`** — the server. This is the source of truth (the systemd unit runs it).
+- `pi-voice-server.service` — the systemd unit file.
 
 ## Related
 
