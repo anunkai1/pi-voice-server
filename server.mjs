@@ -28,6 +28,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { KokoroTTS } from "kokoro-js";
+import { phonemize } from "phonemizer";
 
 const MODEL_ID = process.env.KOKORO_MODEL_ID || "onnx-community/Kokoro-82M-v1.0-ONNX";
 const DTYPE = process.env.KOKORO_DTYPE || "q4";
@@ -136,19 +137,138 @@ function sendJson(res, data, status = 200) {
 }
 
 // ── Text chunking ──────────────────────────────────────────────────
-// Kokoro's phoneme encoder has a fixed ~510-token context window.
-// Anything past it is silently dropped, so a long message would only
-// synthesize the first paragraph. We split on paragraph / sentence
-// boundaries into chunks under a safe char budget and synthesize each
-// separately, then concatenate the audio with a small silence gap.
+// Kokoro's phoneme encoder has a FIXED context window: the tokenizer's
+// model_max_length is 512, and kokoro-js calls it with {truncation:true}
+// (generate() → tokenizer(phonemes, {truncation:true})). So any chunk whose
+// PHONEME tokens exceed ~510 is SILENTLY truncated: Kokoro synthesizes only
+// the first ~510 tokens of that chunk and drops the rest, while the NEXT
+// chunk synthesizes in full. The audible effect is a sentence cut short
+// mid-way ("truncated"), then the following chunk resumes ("continued") —
+// exactly what the LongTTS button was doing on long replies.
 //
-// 500 chars ≈ ~250-350 phoneme tokens for English, comfortably under 510.
-const CHUNK_MAX_CHARS = 500;
+// A char budget alone can't prevent this: the char→phoneme-token ratio
+// ranges from ~0.7 (terse prose) to >1.0 (numbers, currency, polysyllabic
+// words) and higher still for code/URLs. Real voice replies measured at
+// 4/29 chunks silently truncated under the old 500-char cap. So we split on
+// ACTUAL phoneme-token count: phonemize each char-budgeted chunk, tokenize it
+// WITHOUT truncation (to read its true length), and re-split on word
+// boundaries anything over the safe limit.
+const CHUNK_MAX_CHARS = 500; // first-pass char budget (keeps paragraph/sentence/word boundaries)
+const SAFE_TOKEN_LIMIT = 480; // phoneme tokens; ~30 under the ~510 content cap → margin for safety
 
-function chunkText(text) {
+/**
+ * kokoro-js's post-phonemization cleanup, copied verbatim from
+ * node_modules/kokoro-js/dist/kokoro.js (v1.2.1) so our token count matches
+ * what the library feeds its tokenizer. The 1:1 glyph substitutions
+ * (ʲ→j, r→ɹ, x→k, ɬ→l) don't change the token COUNT; the count-affecting
+ * rules (the "hundred" space insertion, the trailing "s"/"z" join, the
+ * "ninety"→"ninedi" fix) are rare but included for an exact match.
+ * `lang` is "a" (en-us) or "b" (en-gb), mirroring kokoro's _validate_voice.
+ */
+function kokoroPostProcess(joined, lang = "a") {
+	let i = joined
+		.replace(/kəkˈoːɹoʊ/g, "kˈoʊkəɹoʊ")
+		.replace(/kəkˈɔːɹəʊ/g, "kˈəʊkəɹoʊ")
+		.replace(/ʲ/g, "j")
+		.replace(/r/g, "ɹ")
+		.replace(/x/g, "k")
+		.replace(/ɬ/g, "l")
+		.replace(/(?<=[a-zɹː])(?=hˈʌndɹɪd)/g, " ")
+		.replace(/ z(?=[;:,.!?¡¿—…"«»“” ]|$)/g, "z");
+	if (lang === "a") i = i.replace(/(?<=nˈaɪn)ti(?!ː)/g, "di");
+	return i.trim();
+}
+
+/**
+ * True phoneme-token count for `text` — what the model would actually
+ * consume. Phonemizes via espeak-ng WASM (bundled in the `phonemizer` dep),
+ * applies kokoro-js's post-processing, then tokenizes WITHOUT truncation so
+ * the returned length is the real one, not the silently-clamped 512. Returns
+ * 0 on any failure so the caller falls back to the char-budgeted chunk
+ * unchanged (degrading to the pre-fix behavior rather than breaking TTS).
+ */
+async function phonemeTokenCount(text, lang = "a") {
+	try {
+		const ph = (await phonemize(text, lang === "a" ? "en-us" : "en")).join(" ");
+		const processed = kokoroPostProcess(ph, lang);
+		const { input_ids } = tts.tokenizer(processed, { truncation: false });
+		return input_ids.dims.at(-1);
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Re-split a single char-budgeted chunk that measured OVER the token limit,
+ * greedily packing words until adding the next would cross SAFE_TOKEN_LIMIT.
+ * A lone word whose own tokens exceed the limit (vanishingly rare — e.g. a
+ * long URL with no spaces) is hard-split by characters, each half re-checked.
+ */
+async function splitByTokenBudget(chunk, lang = "a") {
+	const pieces = [];
+	let buf = "";
+	for (const w of chunk.split(/\s+/).filter(Boolean)) {
+		const cand = buf ? `${buf} ${w}` : w;
+		if ((await phonemeTokenCount(cand, lang)) > SAFE_TOKEN_LIMIT) {
+			if (buf) {
+				pieces.push(buf);
+				buf = "";
+			}
+			// The word alone is over budget: hard-split it character by character.
+			if ((await phonemeTokenCount(w, lang)) > SAFE_TOKEN_LIMIT) {
+				let half = "";
+				for (const ch of w) {
+					if ((await phonemeTokenCount(half + ch, lang)) > SAFE_TOKEN_LIMIT) {
+						if (half) pieces.push(half);
+						half = ch;
+					} else {
+						half += ch;
+					}
+				}
+				if (half) pieces.push(half);
+				continue;
+			}
+			buf = w;
+		} else {
+			buf = cand;
+		}
+	}
+	if (buf) pieces.push(buf);
+	return pieces;
+}
+
+/**
+ * Split `text` into chunks each safe for Kokoro's context window. Two passes:
+ *   1) hierarchical char-based split (paragraph → sentence → word) for
+ *      natural boundaries and to keep most chunks intact, then
+ *   2) a token-aware pass that measures each chunk's phoneme tokens and
+ *      re-splits any that exceed SAFE_TOKEN_LIMIT.
+ * `voice` selects the phonemization language (a*=en-us, b*=en-gb), matching
+ * what kokoro-js itself uses.
+ */
+async function chunkText(text, voice = DEFAULT_VOICE) {
+	const lang = voice.at(0) === "b" ? "b" : "a";
+	const charChunks = charSplit(text, CHUNK_MAX_CHARS);
+	const out = [];
+	for (const ch of charChunks) {
+		if ((await phonemeTokenCount(ch, lang)) <= SAFE_TOKEN_LIMIT) {
+			out.push(ch);
+		} else {
+			out.push(...(await splitByTokenBudget(ch, lang)));
+		}
+	}
+	return out;
+}
+
+/**
+ * Pure synchronous char-budget splitter (paragraph → sentence → word wrap).
+ * Extracted from the original chunkText so the token-aware pass above can
+ * start from good boundaries before measuring phoneme tokens.
+ */
+function charSplit(text, maxChars) {
 	const clean = text.replace(/\r\n/g, "\n").trim();
 	if (!clean) return [];
-	if (clean.length <= CHUNK_MAX_CHARS) return [clean];
+	if (clean.length <= maxChars) return [clean];
 
 	const chunks = [];
 	const pushIf = (s) => {
@@ -158,7 +278,7 @@ function chunkText(text) {
 
 	// Split on blank lines (paragraphs) first.
 	for (const para of clean.split(/\n\s*\n/)) {
-		if (para.length <= CHUNK_MAX_CHARS) {
+		if (para.length <= maxChars) {
 			pushIf(para);
 			continue;
 		}
@@ -168,7 +288,7 @@ function chunkText(text) {
 		for (const sent of sentences) {
 			const s = sent.trim();
 			if (!s) continue;
-			if (s.length > CHUNK_MAX_CHARS) {
+			if (s.length > maxChars) {
 				// Single sentence longer than budget: flush, then hard-wrap by word.
 				if (buf) {
 					pushIf(buf);
@@ -176,7 +296,7 @@ function chunkText(text) {
 				}
 				let wbuf = "";
 				for (const w of s.split(/\s+/)) {
-					if ((wbuf + " " + w).trim().length > CHUNK_MAX_CHARS) {
+					if ((wbuf + " " + w).trim().length > maxChars) {
 						pushIf(wbuf);
 						wbuf = w;
 					} else {
@@ -186,7 +306,7 @@ function chunkText(text) {
 				if (wbuf) pushIf(wbuf);
 				continue;
 			}
-			if ((buf + " " + s).length > CHUNK_MAX_CHARS) {
+			if ((buf + " " + s).length > maxChars) {
 				pushIf(buf);
 				buf = s;
 			} else {
@@ -235,7 +355,7 @@ const server = createServer(async (req, res) => {
 			const speed = Number(body.speed ?? 1.0);
 
 			const result = await enqueueTts(async () => {
-				const chunks = chunkText(text);
+				const chunks = await chunkText(text, voice);
 				log(`tts: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 				let sampleRate = 0;
 				const parts = [];
@@ -283,8 +403,6 @@ const server = createServer(async (req, res) => {
 			if (!text) return sendJson(res, { error: "missing 'text'" }, 400);
 			const voice = body.voice || DEFAULT_VOICE;
 			const speed = Number(body.speed ?? 1.0);
-			const chunks = chunkText(text);
-			log(`tts/stream: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 
 			res.writeHead(200, {
 				"Content-Type": "application/octet-stream",
@@ -308,6 +426,8 @@ const server = createServer(async (req, res) => {
 
 			await enqueueTts(async () => {
 				try {
+					const chunks = await chunkText(text, voice);
+					log(`tts/stream: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 					let sampleRate = 0;
 					for (let i = 0; i < chunks.length; i++) {
 						if (clientGone) break;
