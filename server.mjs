@@ -441,13 +441,17 @@ const server = createServer(async (req, res) => {
 			// Client disconnect detection: stop synthesizing remaining chunks
 			// if the browser navigates away or hits stop mid-stream.
 			let clientGone = false;
+			let streamedAudioBytes = 0;
 			req.once("aborted", () => { clientGone = true; });
 			res.on("close", () => { clientGone = true; });
 			const writeFrame = async (type, payload) => {
 				if (clientGone) throw new HttpError(499, "client disconnected");
 				const plen = payload ? payload.length : 0;
-				if (plen > MAX_AUDIO_BYTES) {
-					throw new HttpError(413, `audio frame exceeds KOKORO_MAX_AUDIO_BYTES (${plen} > ${MAX_AUDIO_BYTES})`);
+				if (type === 0x01) {
+					streamedAudioBytes += plen;
+					if (streamedAudioBytes > MAX_AUDIO_BYTES) {
+						throw new HttpError(413, `streamed audio exceeds KOKORO_MAX_AUDIO_BYTES (${streamedAudioBytes} > ${MAX_AUDIO_BYTES})`);
+					}
 				}
 				const header = Buffer.allocUnsafe(5);
 				header[0] = type;
