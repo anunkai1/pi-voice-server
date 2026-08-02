@@ -5,10 +5,14 @@
   "description": "Minimal Kokoro TTS HTTP server (adapted from @s1m0n38/pi-voice, MIT)",
   "type": "module",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "kokoro-js": "^1.2.1",
     "phonemizer": "1.2.1"
+  },
+  "overrides": {
+    "sharp": "^0.35.3"
   }
 }

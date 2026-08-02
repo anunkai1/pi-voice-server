@@ -29,12 +29,20 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { KokoroTTS } from "kokoro-js";
 import { phonemize } from "phonemizer";
+import {
+	HttpError,
+	MAX_TEXT_CHARS,
+	parseTtsRequest,
+	readBody,
+	writeWithBackpressure,
+} from "./lib/http-utils.mjs";
 
 const MODEL_ID = process.env.KOKORO_MODEL_ID || "onnx-community/Kokoro-82M-v1.0-ONNX";
 const DTYPE = process.env.KOKORO_DTYPE || "q4";
 const DEFAULT_VOICE = process.env.KOKORO_VOICE || "af_heart";
 const HOST = process.env.KOKORO_HOST || "127.0.0.1";
 const PORT = Number(process.env.KOKORO_PORT || 8181);
+const MAX_AUDIO_BYTES = Math.max(1024 * 1024, Number(process.env.KOKORO_MAX_AUDIO_BYTES) || 64 * 1024 * 1024);
 
 let tts = null;
 const stateFile = resolve(homedir(), ".pi", "voice", "server-state.json");
@@ -69,6 +77,9 @@ function float32ToWav(samples, sampleRate) {
 	const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
 	const blockAlign = numChannels * (bitsPerSample / 8);
 	const dataSize = samples.length * (bitsPerSample / 8);
+	if (44 + dataSize > MAX_AUDIO_BYTES) {
+		throw new HttpError(413, `generated audio exceeds KOKORO_MAX_AUDIO_BYTES (${44 + dataSize} > ${MAX_AUDIO_BYTES})`);
+	}
 	const buf = Buffer.alloc(44 + dataSize);
 	buf.write("RIFF", 0);
 	buf.writeUInt32LE(36 + dataSize, 4);
@@ -92,38 +103,55 @@ function float32ToWav(samples, sampleRate) {
 	return buf;
 }
 
-// 2 MB hard cap on any single request body. TTS text is tiny (the
-// agentchatbox proxy caps at 30 000 chars; kidstories sends a page at a
-// time), so this only ever trips on misuse/abuse — but without it a single
-// oversized POST would accumulate unbounded chunks and OOM the warm-model
-// process (a cold reload is ~600 ms + ~291 MB).
-const MAX_BODY_BYTES = 2 * 1024 * 1024;
+/** Convert multiple PCM parts directly into one WAV without first allocating
+ * a second merged Float32Array. This halves the large-response copy overhead. */
+function float32PartsToWav(parts, sampleRate) {
+	const totalSamples = parts.reduce((sum, part) => sum + part.length, 0);
+	const dataSize = totalSamples * 2;
+	if (44 + dataSize > MAX_AUDIO_BYTES) {
+		throw new HttpError(413, `generated audio exceeds KOKORO_MAX_AUDIO_BYTES (${44 + dataSize} > ${MAX_AUDIO_BYTES})`);
+	}
+	const buf = Buffer.alloc(44 + dataSize);
+	buf.write("RIFF", 0);
+	buf.writeUInt32LE(36 + dataSize, 4);
+	buf.write("WAVE", 8);
+	buf.write("fmt ", 12);
+	buf.writeUInt32LE(16, 16);
+	buf.writeUInt16LE(1, 20);
+	buf.writeUInt16LE(1, 22);
+	buf.writeUInt32LE(sampleRate, 24);
+	buf.writeUInt32LE(sampleRate * 2, 28);
+	buf.writeUInt16LE(2, 32);
+	buf.writeUInt16LE(16, 34);
+	buf.write("data", 36);
+	buf.writeUInt32LE(dataSize, 40);
+	let offset = 44;
+	for (const samples of parts) {
+		for (let i = 0; i < samples.length; i++) {
+			const sample = Math.max(-1, Math.min(1, samples[i] ?? 0));
+			buf.writeInt16LE(Math.round(sample * 0x7fff), offset);
+			offset += 2;
+		}
+	}
+	return buf;
+}
 
-function readBody(req) {
-	return new Promise((resolveP, rejectP) => {
-		const chunks = [];
-		let size = 0;
-		let aborted = false;
-		req.on("data", (c) => {
-			if (aborted) return;
-			size += c.length;
-			if (size > MAX_BODY_BYTES) {
-				// Stop ingesting, tear down the socket, and reject. The handler's
-				// catch turns this into a 500 with a clear message. Destroying is
-				// intentional: we don't want to buffer the rest of a runaway body.
-				aborted = true;
-				req.destroy();
-				rejectP(new Error(`request body too large (max ${MAX_BODY_BYTES} bytes)`));
-				return;
-			}
-			chunks.push(c);
-		});
-		req.on("end", () => {
-			if (!aborted) resolveP(Buffer.concat(chunks).toString("utf-8"));
-		});
-		req.on("error", (e) => {
-			if (!aborted) rejectP(e);
-		});
+async function readTtsRequest(req) {
+	const contentType = String(req.headers["content-type"] || "").toLowerCase();
+	if (!contentType.includes("application/json")) {
+		throw new HttpError(415, "Content-Type must be application/json");
+	}
+	let body;
+	try {
+		body = JSON.parse(await readBody(req));
+	} catch (error) {
+		if (error instanceof HttpError) throw error;
+		throw new HttpError(400, "invalid JSON body");
+	}
+	return parseTtsRequest(body, {
+		voices: Object.keys(tts.voices),
+		defaultVoice: DEFAULT_VOICE,
+		maxTextChars: MAX_TEXT_CHARS,
 	});
 }
 
@@ -338,6 +366,8 @@ const server = createServer(async (req, res) => {
 				dtype: DTYPE,
 				voice: DEFAULT_VOICE,
 				voiceCount: tts ? Object.keys(tts.voices).length : 0,
+				maxTextChars: MAX_TEXT_CHARS,
+				maxAudioBytes: MAX_AUDIO_BYTES,
 			});
 		}
 
@@ -348,41 +378,45 @@ const server = createServer(async (req, res) => {
 
 		if (path === "/tts" && req.method === "POST") {
 			if (!tts) return sendJson(res, { error: "model not loaded" }, 503);
-			const body = JSON.parse(await readBody(req));
-			const text = (body.text ?? "").trim();
-			if (!text) return sendJson(res, { error: "missing 'text'" }, 400);
-			const voice = body.voice || DEFAULT_VOICE;
-			const speed = Number(body.speed ?? 1.0);
+			const { text, voice, speed } = await readTtsRequest(req);
+			let clientGone = false;
+			req.once("aborted", () => { clientGone = true; });
+			res.once("close", () => { if (!res.writableEnded) clientGone = true; });
 
 			const result = await enqueueTts(async () => {
+				if (clientGone) throw new HttpError(499, "client disconnected");
 				const chunks = await chunkText(text, voice);
 				log(`tts: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 				let sampleRate = 0;
 				const parts = [];
+				let estimatedWavBytes = 44;
 				for (let i = 0; i < chunks.length; i++) {
+					if (clientGone) throw new HttpError(499, "client disconnected");
 					const audio = await tts.generate(chunks[i], { voice, speed });
+					if (clientGone) throw new HttpError(499, "client disconnected");
 					sampleRate = audio.sampling_rate;
 					parts.push(audio.audio);
+					estimatedWavBytes += audio.audio.length * 2;
 					// ~200ms silence between chunks so sentences don't run together.
 					if (i < chunks.length - 1) {
-						parts.push(new Float32Array(Math.floor(sampleRate * 0.2)));
+						const silence = new Float32Array(Math.floor(sampleRate * 0.2));
+						parts.push(silence);
+						estimatedWavBytes += silence.length * 2;
+					}
+					if (estimatedWavBytes > MAX_AUDIO_BYTES) {
+						throw new HttpError(413, `generated audio exceeds KOKORO_MAX_AUDIO_BYTES (${estimatedWavBytes} > ${MAX_AUDIO_BYTES})`);
 					}
 				}
-				const total = parts.reduce((n, p) => n + p.length, 0);
-				const merged = new Float32Array(total);
-				let off = 0;
-				for (const p of parts) {
-					merged.set(p, off);
-					off += p.length;
-				}
-				return float32ToWav(merged, sampleRate);
+				return float32PartsToWav(parts, sampleRate);
 			});
+			if (clientGone) return;
 			res.writeHead(200, {
 				"Content-Type": "audio/wav",
 				"Content-Length": result.length,
 				"Cache-Control": "no-store",
 			});
-			return res.end(result);
+			await writeWithBackpressure(res, result, () => clientGone);
+			return res.end();
 		}
 
 		// Streaming variant: synthesize chunks one at a time and write each
@@ -398,11 +432,7 @@ const server = createServer(async (req, res) => {
 		//     type 0x80 ERR  → payload = UTF-8 error message
 		if (path === "/tts/stream" && req.method === "POST") {
 			if (!tts) return sendJson(res, { error: "model not loaded" }, 503);
-			const body = JSON.parse(await readBody(req));
-			const text = (body.text ?? "").trim();
-			if (!text) return sendJson(res, { error: "missing 'text'" }, 400);
-			const voice = body.voice || DEFAULT_VOICE;
-			const speed = Number(body.speed ?? 1.0);
+			const { text, voice, speed } = await readTtsRequest(req);
 
 			res.writeHead(200, {
 				"Content-Type": "application/octet-stream",
@@ -411,21 +441,24 @@ const server = createServer(async (req, res) => {
 			// Client disconnect detection: stop synthesizing remaining chunks
 			// if the browser navigates away or hits stop mid-stream.
 			let clientGone = false;
-			res.on("close", () => {
-				clientGone = true;
-			});
-			const writeFrame = (type, payload) => {
-				if (clientGone) return;
+			req.once("aborted", () => { clientGone = true; });
+			res.on("close", () => { clientGone = true; });
+			const writeFrame = async (type, payload) => {
+				if (clientGone) throw new HttpError(499, "client disconnected");
 				const plen = payload ? payload.length : 0;
-				const buf = Buffer.allocUnsafe(5 + plen);
-				buf[0] = type;
-				buf.writeUInt32LE(plen, 1);
-				if (payload && plen) payload.copy(buf, 5);
-				res.write(buf);
+				if (plen > MAX_AUDIO_BYTES) {
+					throw new HttpError(413, `audio frame exceeds KOKORO_MAX_AUDIO_BYTES (${plen} > ${MAX_AUDIO_BYTES})`);
+				}
+				const header = Buffer.allocUnsafe(5);
+				header[0] = type;
+				header.writeUInt32LE(plen, 1);
+				await writeWithBackpressure(res, header, () => clientGone);
+				if (payload && plen) await writeWithBackpressure(res, payload, () => clientGone);
 			};
 
 			await enqueueTts(async () => {
 				try {
+					if (clientGone) return;
 					const chunks = await chunkText(text, voice);
 					log(`tts/stream: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 					let sampleRate = 0;
@@ -444,12 +477,13 @@ const server = createServer(async (req, res) => {
 							cat.set(sil, samples.length);
 							samples = cat;
 						}
-						writeFrame(0x01, float32ToWav(samples, sampleRate));
+						await writeFrame(0x01, float32ToWav(samples, sampleRate));
 					}
-					writeFrame(0x00, null); // END
+					if (!clientGone) await writeFrame(0x00, null); // END
 				} catch (err) {
+					if (clientGone || (err instanceof HttpError && err.status === 499)) return;
 					log("tts/stream synth error:", err);
-					writeFrame(0x80, Buffer.from(err instanceof Error ? err.message : String(err), "utf8"));
+					await writeFrame(0x80, Buffer.from(err instanceof Error ? err.message : String(err), "utf8"));
 				} finally {
 					try {
 						res.end();
@@ -463,9 +497,13 @@ const server = createServer(async (req, res) => {
 
 		return sendJson(res, { error: "not found" }, 404);
 	} catch (err) {
+		if (err instanceof HttpError && err.status === 499) return;
 		log("request error:", err);
 		if (!res.headersSent) {
-			sendJson(res, { error: err instanceof Error ? err.message : String(err) }, 500);
+			const status = err instanceof HttpError ? err.status : 500;
+			sendJson(res, { error: err instanceof Error ? err.message : String(err) }, status);
+		} else {
+			res.destroy();
 		}
 	}
 });
