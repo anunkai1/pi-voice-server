@@ -43,6 +43,10 @@ const DEFAULT_VOICE = process.env.KOKORO_VOICE || "af_heart";
 const HOST = process.env.KOKORO_HOST || "127.0.0.1";
 const PORT = Number(process.env.KOKORO_PORT || 8181);
 const MAX_AUDIO_BYTES = Math.max(1024 * 1024, Number(process.env.KOKORO_MAX_AUDIO_BYTES) || 64 * 1024 * 1024);
+const SHUTDOWN_DRAIN_TIMEOUT_MS = Math.max(
+	10000,
+	Number(process.env.SHUTDOWN_DRAIN_TIMEOUT_MS) || 600000,
+);
 
 let tts = null;
 const stateFile = resolve(homedir(), ".pi", "voice", "server-state.json");
@@ -348,9 +352,16 @@ function charSplit(text, maxChars) {
 
 // Serialize /tts calls — Kokoro synthesis is not concurrency-safe on one model.
 let ttsChain = Promise.resolve();
+let activeSyntheses = 0;
+let shuttingDown = false;
 function enqueueTts(fn) {
+	activeSyntheses += 1;
 	const next = ttsChain.then(fn, fn);
 	ttsChain = next.catch(() => {});
+	void next.then(
+		() => { activeSyntheses -= 1; },
+		() => { activeSyntheses -= 1; },
+	);
 	return next;
 }
 
@@ -361,13 +372,14 @@ const server = createServer(async (req, res) => {
 
 		if (path === "/health" && req.method === "GET") {
 			return sendJson(res, {
-				status: "ok",
 				modelLoaded: tts !== null,
 				dtype: DTYPE,
 				voice: DEFAULT_VOICE,
 				voiceCount: tts ? Object.keys(tts.voices).length : 0,
 				maxTextChars: MAX_TEXT_CHARS,
 				maxAudioBytes: MAX_AUDIO_BYTES,
+				activeSyntheses,
+				status: shuttingDown ? "draining" : "ok",
 			});
 		}
 
@@ -524,3 +536,34 @@ loadModel()
 		log("FATAL: model load failed:", err);
 		process.exit(1);
 	});
+
+async function shutdown(signal) {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	log(`received ${signal}; draining ${activeSyntheses} synthesis request(s)`);
+
+	const closed = server.listening
+		? new Promise((resolveClose, rejectClose) => {
+			server.close((error) => (error ? rejectClose(error) : resolveClose()));
+		})
+		: Promise.resolve();
+	let timer;
+	const timeout = new Promise((_, reject) => {
+		timer = setTimeout(
+			() => reject(new Error(`shutdown drain exceeded ${SHUTDOWN_DRAIN_TIMEOUT_MS}ms`)),
+			SHUTDOWN_DRAIN_TIMEOUT_MS,
+		);
+	});
+
+	try {
+		await Promise.race([Promise.all([closed, ttsChain]), timeout]);
+		clearTimeout(timer);
+		process.exit(0);
+	} catch (error) {
+		log("shutdown failed:", error instanceof Error ? error.message : String(error));
+		process.exit(1);
+	}
+}
+
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
