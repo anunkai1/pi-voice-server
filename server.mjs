@@ -56,7 +56,18 @@ const SHUTDOWN_DRAIN_TIMEOUT_MS = Math.max(
 const IDLE_TIMEOUT_MS = parseIdleTimeout(process.env.KOKORO_IDLE_TIMEOUT_MS);
 const LISTEN_TARGET = resolveListenTarget({ host: HOST, port: PORT });
 
+// Keep voice validation and /voices available while the expensive model is
+// absent. This is the exact Kokoro 82M v1 voice catalogue; model load verifies
+// it before serving synthesis so upstream drift fails closed.
+const KNOWN_VOICES = [
+	"af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore", "af_nicole",
+	"af_nova", "af_river", "af_sarah", "af_sky", "am_adam", "am_echo", "am_eric", "am_fenrir",
+	"am_liam", "am_michael", "am_onyx", "am_puck", "am_santa", "bf_emma", "bf_isabella",
+	"bm_george", "bm_lewis", "bf_alice", "bf_lily", "bm_daniel", "bm_fable",
+];
+
 let tts = null;
+let modelLoadPromise = null;
 const stateFile = resolve(homedir(), ".pi", "voice", "server-state.json");
 
 function log(...args) {
@@ -76,10 +87,30 @@ function saveState(s) {
 async function loadModel() {
 	log(`loading model ${MODEL_ID} (dtype=${DTYPE}) …`);
 	const t0 = Date.now();
-	tts = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: DTYPE, device: "cpu" });
-	const voices = Object.keys(tts.voices);
+	const loaded = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: DTYPE, device: "cpu" });
+	const voices = Object.keys(loaded.voices);
+	if (JSON.stringify(voices) !== JSON.stringify(KNOWN_VOICES)) {
+		await loaded.model.dispose();
+		throw new Error("loaded Kokoro voice catalogue does not match the reviewed server catalogue");
+	}
+	tts = loaded;
 	log(`model ready in ${Date.now() - t0}ms — ${voices.length} voices available`);
 	saveState({ modelLoaded: true, dtype: DTYPE, voices, at: new Date().toISOString() });
+	return loaded;
+}
+
+async function ensureModel() {
+	if (tts) return tts;
+	modelLoadPromise ??= loadModel().finally(() => { modelLoadPromise = null; });
+	try {
+		return await modelLoadPromise;
+	} catch (error) {
+		// Preserve the request error, then let systemd replace a process whose
+		// native/model initialisation failed. The socket queues later callers.
+		const timer = setTimeout(() => process.exit(1), 1000);
+		timer.unref();
+		throw error;
+	}
 }
 
 /** Float32 PCM → 16-bit little-endian PCM WAV Buffer. */
@@ -161,7 +192,7 @@ async function readTtsRequest(req) {
 		throw new HttpError(400, "invalid JSON body");
 	}
 	return parseTtsRequest(body, {
-		voices: Object.keys(tts.voices),
+		voices: KNOWN_VOICES,
 		defaultVoice: DEFAULT_VOICE,
 		maxTextChars: MAX_TEXT_CHARS,
 	});
@@ -387,10 +418,14 @@ const server = createServer(async (req, res) => {
 
 		if (path === "/health" && req.method === "GET") {
 			return sendJson(res, {
-				modelLoaded: tts !== null,
+				// Backwards-compatible capability flag used by existing consumers;
+				// modelResident reports whether native weights are currently warm.
+				modelLoaded: true,
+				modelResident: tts !== null,
+				modelLoading: modelLoadPromise !== null,
 				dtype: DTYPE,
 				voice: DEFAULT_VOICE,
-				voiceCount: tts ? Object.keys(tts.voices).length : 0,
+				voiceCount: KNOWN_VOICES.length,
 				maxTextChars: MAX_TEXT_CHARS,
 				maxAudioBytes: MAX_AUDIO_BYTES,
 				idleTimeoutMs: IDLE_TIMEOUT_MS,
@@ -400,12 +435,10 @@ const server = createServer(async (req, res) => {
 		}
 
 		if (path === "/voices" && req.method === "GET") {
-			if (!tts) return sendJson(res, { error: "model not loaded" }, 503);
-			return sendJson(res, { voices: Object.keys(tts.voices) });
+			return sendJson(res, { voices: KNOWN_VOICES });
 		}
 
 		if (path === "/tts" && req.method === "POST") {
-			if (!tts) return sendJson(res, { error: "model not loaded" }, 503);
 			const { text, voice, speed } = await readTtsRequest(req);
 			let clientGone = false;
 			req.once("aborted", () => { clientGone = true; });
@@ -413,6 +446,7 @@ const server = createServer(async (req, res) => {
 
 			const result = await enqueueTts(async () => {
 				if (clientGone) throw new HttpError(499, "client disconnected");
+				const activeTts = await ensureModel();
 				const chunks = await chunkText(text, voice);
 				log(`tts: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 				let sampleRate = 0;
@@ -420,7 +454,7 @@ const server = createServer(async (req, res) => {
 				let estimatedWavBytes = 44;
 				for (let i = 0; i < chunks.length; i++) {
 					if (clientGone) throw new HttpError(499, "client disconnected");
-					const audio = await tts.generate(chunks[i], { voice, speed });
+					const audio = await activeTts.generate(chunks[i], { voice, speed });
 					if (clientGone) throw new HttpError(499, "client disconnected");
 					sampleRate = audio.sampling_rate;
 					parts.push(audio.audio);
@@ -459,7 +493,6 @@ const server = createServer(async (req, res) => {
 		//     type 0x00 END  → no payload; clean end of stream
 		//     type 0x80 ERR  → payload = UTF-8 error message
 		if (path === "/tts/stream" && req.method === "POST") {
-			if (!tts) return sendJson(res, { error: "model not loaded" }, 503);
 			const { text, voice, speed } = await readTtsRequest(req);
 
 			res.writeHead(200, {
@@ -491,12 +524,13 @@ const server = createServer(async (req, res) => {
 			await enqueueTts(async () => {
 				try {
 					if (clientGone) return;
+					const activeTts = await ensureModel();
 					const chunks = await chunkText(text, voice);
 					log(`tts/stream: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 					let sampleRate = 0;
 					for (let i = 0; i < chunks.length; i++) {
 						if (clientGone) break;
-						const out = await tts.generate(chunks[i], { voice, speed });
+						const out = await activeTts.generate(chunks[i], { voice, speed });
 						sampleRate = out.sampling_rate;
 						let samples = out.audio;
 						// Bake ~200ms of trailing silence into every chunk except
@@ -540,20 +574,16 @@ const server = createServer(async (req, res) => {
 	}
 });
 
-// Load model on startup, then adopt systemd's socket (or bind directly for
-// development). Failures restart through systemd; clean idle exits remain
-// stopped until the socket receives the next request.
-loadModel()
-	.then(() => {
-		server.listen(LISTEN_TARGET.options, () => {
-			log(`listening on ${LISTEN_TARGET.source}; idle shutdown=${IDLE_TIMEOUT_MS}ms`);
-			idleShutdown.start();
-		});
-	})
-	.catch((err) => {
-		log("FATAL: model load failed:", err);
-		process.exit(1);
-	});
+// Listen without loading the model. Health and voice-list probes therefore
+// remain cheap; the first synthesis request loads the model inside the serial
+// work queue. After a synthesis burst, clean idle exit releases the process.
+server.listen(LISTEN_TARGET.options, () => {
+	log(`listening on ${LISTEN_TARGET.source}; lazy model; idle shutdown=${IDLE_TIMEOUT_MS}ms`);
+});
+server.on("error", (error) => {
+	log("FATAL: HTTP listener failed:", error);
+	process.exit(1);
+});
 
 async function shutdown(signal) {
 	if (shuttingDown) return;

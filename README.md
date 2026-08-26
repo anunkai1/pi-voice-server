@@ -2,8 +2,9 @@
 
 Minimal **Kokoro-82M** TTS HTTP server. Loads one ONNX model on startup, keeps
 it warm during a synthesis burst, and serves speech over a tiny REST surface.
-Production uses systemd socket activation and shuts the model process down
-after ten idle minutes so ONNX inference arenas do not retain RAM indefinitely.
+Production uses systemd socket activation, loads the model only for synthesis,
+and shuts the model process down after ten idle minutes so ONNX inference
+arenas do not retain RAM indefinitely.
 
 This is the speech backend for [**agentchatbox**](https://github.com/anunkai1/agentchatbox)
 (its `/api/tts` proxies here) and [**kidstories**](https://gitea.mavali.top/admin/kidstories)
@@ -20,15 +21,16 @@ Rewritten to use [`kokoro-js`](https://www.npmjs.com/package/kokoro-js) directly
 Kokoro's ONNX model is ~291 MB and takes ~600 ms to cold-load. Keeping it
 resident through a burst means synthesis is ~1.5 s/sentence instead of
 reloading for every call. Every consumer (agentchatbox, kidstories) shares one
-model over HTTP. The production socket queues the first request while a cold
-model loads, and a ten-minute idle shutdown releases the model and retained
-native inference workspace between bursts.
+model over HTTP. Health and voice-list requests never load the model. The first
+synthesis request loads it inside the serial queue, and a ten-minute post-burst
+idle shutdown releases the model and retained native inference workspace.
+Systemd's socket queues a request while the lightweight process starts.
 
 ## Endpoints
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| `GET` | `/health` | — | `{ status, modelLoaded, dtype, voice, voiceCount }` |
+| `GET` | `/health` | — | capability plus `modelResident`/`modelLoading`, dtype and voice metadata |
 | `GET` | `/voices` | — | `{ voices: string[] }` (28 Kokoro voices) |
 | `POST` | `/tts` | `{ text, voice?, speed? }` | `audio/wav` — whole blob, all chunks concatenated |
 | `POST` | `/tts/stream` | `{ text, voice?, speed? }` | `application/octet-stream` — chunked binary frame stream |
@@ -95,8 +97,8 @@ curl -X POST http://127.0.0.1:8181/tts \
 
 Server2's production service and socket units are maintained in the private
 [`infra/systemd/`](https://gitea.mavali.top/admin/infra) deployment manifest.
-The socket owns `127.0.0.1:8181`, queues a cold request while this process loads,
-and starts the service on demand. The service accepts exactly one named
+The socket owns `127.0.0.1:8181`, queues a request while the lightweight process
+starts, and activates the service on demand. The service accepts exactly one named
 systemd file descriptor (`tts`) and otherwise falls back to `KOKORO_HOST` /
 `KOKORO_PORT` for development and candidate smoke tests.
 
