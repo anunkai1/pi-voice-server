@@ -17,7 +17,8 @@
  *   KOKORO_DTYPE     default "q4"   (q4 | q4f16 | q8 | fp16 | fp32)
  *   KOKORO_VOICE     default "af_heart"
  *   KOKORO_HOST      default "127.0.0.1"
- *   KOKORO_PORT      default 8181
+ *   KOKORO_PORT      default 8181 (used without a systemd socket)
+ *   KOKORO_IDLE_TIMEOUT_MS default 600000 (10 minutes)
  *
  * Model files are cached by transformers.js under
  *   ~/.cache/huggingface/transformers/  (XDG: $XDG_CACHE_HOME)
@@ -36,6 +37,11 @@ import {
 	readBody,
 	writeWithBackpressure,
 } from "./lib/http-utils.mjs";
+import {
+	createIdleShutdownTimer,
+	parseIdleTimeout,
+	resolveListenTarget,
+} from "./lib/lifecycle.mjs";
 
 const MODEL_ID = process.env.KOKORO_MODEL_ID || "onnx-community/Kokoro-82M-v1.0-ONNX";
 const DTYPE = process.env.KOKORO_DTYPE || "q4";
@@ -47,6 +53,8 @@ const SHUTDOWN_DRAIN_TIMEOUT_MS = Math.max(
 	10000,
 	Number(process.env.SHUTDOWN_DRAIN_TIMEOUT_MS) || 600000,
 );
+const IDLE_TIMEOUT_MS = parseIdleTimeout(process.env.KOKORO_IDLE_TIMEOUT_MS);
+const LISTEN_TARGET = resolveListenTarget({ host: HOST, port: PORT });
 
 let tts = null;
 const stateFile = resolve(homedir(), ".pi", "voice", "server-state.json");
@@ -354,14 +362,21 @@ function charSplit(text, maxChars) {
 let ttsChain = Promise.resolve();
 let activeSyntheses = 0;
 let shuttingDown = false;
+const idleShutdown = createIdleShutdownTimer({
+	timeoutMs: IDLE_TIMEOUT_MS,
+	isIdle: () => activeSyntheses === 0,
+	onIdle: () => void shutdown("idle timeout"),
+});
 function enqueueTts(fn) {
+	idleShutdown.workStarted();
 	activeSyntheses += 1;
 	const next = ttsChain.then(fn, fn);
 	ttsChain = next.catch(() => {});
-	void next.then(
-		() => { activeSyntheses -= 1; },
-		() => { activeSyntheses -= 1; },
-	);
+	const settled = () => {
+		activeSyntheses -= 1;
+		idleShutdown.workFinished();
+	};
+	void next.then(settled, settled);
 	return next;
 }
 
@@ -378,6 +393,7 @@ const server = createServer(async (req, res) => {
 				voiceCount: tts ? Object.keys(tts.voices).length : 0,
 				maxTextChars: MAX_TEXT_CHARS,
 				maxAudioBytes: MAX_AUDIO_BYTES,
+				idleTimeoutMs: IDLE_TIMEOUT_MS,
 				activeSyntheses,
 				status: shuttingDown ? "draining" : "ok",
 			});
@@ -524,12 +540,14 @@ const server = createServer(async (req, res) => {
 	}
 });
 
-// Load model on startup, then listen. If the model load fails, the process
-// exits and systemd will restart it (Restart=on-failure).
+// Load model on startup, then adopt systemd's socket (or bind directly for
+// development). Failures restart through systemd; clean idle exits remain
+// stopped until the socket receives the next request.
 loadModel()
 	.then(() => {
-		server.listen(PORT, HOST, () => {
-			log(`listening on http://${HOST}:${PORT}`);
+		server.listen(LISTEN_TARGET.options, () => {
+			log(`listening on ${LISTEN_TARGET.source}; idle shutdown=${IDLE_TIMEOUT_MS}ms`);
+			idleShutdown.start();
 		});
 	})
 	.catch((err) => {
@@ -540,6 +558,7 @@ loadModel()
 async function shutdown(signal) {
 	if (shuttingDown) return;
 	shuttingDown = true;
+	idleShutdown.stop();
 	log(`received ${signal}; draining ${activeSyntheses} synthesis request(s)`);
 
 	const closed = server.listening

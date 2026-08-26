@@ -1,7 +1,9 @@
 # pi-voice-server
 
 Minimal **Kokoro-82M** TTS HTTP server. Loads one ONNX model on startup, keeps
-it warm in memory, and serves synthesized speech over a tiny REST surface.
+it warm during a synthesis burst, and serves speech over a tiny REST surface.
+Production uses systemd socket activation and shuts the model process down
+after ten idle minutes so ONNX inference arenas do not retain RAM indefinitely.
 
 This is the speech backend for [**agentchatbox**](https://github.com/anunkai1/agentchatbox)
 (its `/api/tts` proxies here) and [**kidstories**](https://gitea.mavali.top/admin/kidstories)
@@ -16,9 +18,11 @@ Rewritten to use [`kokoro-js`](https://www.npmjs.com/package/kokoro-js) directly
 ## Why a separate server?
 
 Kokoro's ONNX model is ~291 MB and takes ~600 ms to cold-load. Keeping it
-resident in a long-lived process means synthesis is ~1.5 s/sentence instead
-of ~2-3 s (model reload every call). Every consumer (agentchatbox, kidstories)
-shares one warm model over HTTP.
+resident through a burst means synthesis is ~1.5 s/sentence instead of
+reloading for every call. Every consumer (agentchatbox, kidstories) shares one
+model over HTTP. The production socket queues the first request while a cold
+model loads, and a ten-minute idle shutdown releases the model and retained
+native inference workspace between bursts.
 
 ## Endpoints
 
@@ -63,7 +67,8 @@ All via environment variables (defaults shown):
 | `KOKORO_DTYPE` | `q4` | ONNX quantization (`q4` \| `q4f16` \| `q8` \| `fp16` \| `fp32`) |
 | `KOKORO_VOICE` | `af_heart` | Default voice (warm female narrator; see `/voices` for all 28) |
 | `KOKORO_HOST` | `127.0.0.1` | Bind host |
-| `KOKORO_PORT` | `8181` | Bind port |
+| `KOKORO_PORT` | `8181` | Bind port when systemd did not pass a socket |
+| `KOKORO_IDLE_TIMEOUT_MS` | `600000` | Idle time before graceful process exit (1 minute–24 hours) |
 
 Model files are cached by `kokoro-js` under `~/.cache/huggingface/transformers/`
 (XDG: `$XDG_CACHE_HOME`).
@@ -86,21 +91,19 @@ curl -X POST http://127.0.0.1:8181/tts \
   --output out.wav
 ```
 
-## Run as a systemd service
+## Run with systemd socket activation
 
-A unit file is included (`pi-voice-server.service`) and mirrored into the
-deploy manifest at [`infra/systemd/pi-voice-server.service`](https://gitea.mavali.top/admin/infra).
-
-```bash
-sudo cp pi-voice-server.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now pi-voice-server
-```
+Server2's production service and socket units are maintained in the private
+[`infra/systemd/`](https://gitea.mavali.top/admin/infra) deployment manifest.
+The socket owns `127.0.0.1:8181`, queues a cold request while this process loads,
+and starts the service on demand. The service accepts exactly one named
+systemd file descriptor (`tts`) and otherwise falls back to `KOKORO_HOST` /
+`KOKORO_PORT` for development and candidate smoke tests.
 
 ## Files
 
 - **`server.mjs`** — the server. This is the source of truth (the systemd unit runs it).
-- `pi-voice-server.service` — the systemd unit file.
+- `lib/lifecycle.mjs` — socket-activation and idle-shutdown lifecycle helpers.
 
 ## Related
 
