@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
 	createIdleShutdownTimer,
+	modelHealthState,
 	parseIdleTimeout,
 	resolveListenTarget,
 } from "../lib/lifecycle.mjs";
@@ -52,6 +53,21 @@ test("resolveListenTarget adopts exactly the named systemd socket", () => {
 		}),
 		/unexpected systemd socket name/,
 	);
+});
+
+test("model health separates capability from residency", () => {
+	assert.deepEqual(modelHealthState({ resident: false, loading: false }), {
+		modelAvailable: true,
+		modelLoaded: false,
+		modelResident: false,
+		modelLoading: false,
+	});
+	assert.deepEqual(modelHealthState({ resident: true, loading: false }), {
+		modelAvailable: true,
+		modelLoaded: true,
+		modelResident: true,
+		modelLoading: false,
+	});
 });
 
 test("parseIdleTimeout applies a bounded ten-minute default", () => {

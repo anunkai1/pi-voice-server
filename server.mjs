@@ -5,10 +5,10 @@
  * rewritten to avoid the @huggingface/transformers env flags that trigger an
  * onnxruntime-node native-library path-resolution bug on this box.
  *
- * Loads a single Kokoro ONNX model on startup, keeps it warm in memory, and
- * exposes a tiny REST surface:
+ * Lazily loads a single Kokoro ONNX model for synthesis, keeps it warm during
+ * a burst, and exposes a tiny REST surface:
  *
- *   GET  /health            → { status, modelLoaded, voices }
+ *   GET  /health            → capability, residency, and voice metadata
  *   GET  /voices            → { voices: string[] }
  *   POST /tts               → { text, voice?, speed? } → audio/wav bytes
  *
@@ -39,6 +39,7 @@ import {
 } from "./lib/http-utils.mjs";
 import {
 	createIdleShutdownTimer,
+	modelHealthState,
 	parseIdleTimeout,
 	resolveListenTarget,
 } from "./lib/lifecycle.mjs";
@@ -418,11 +419,10 @@ const server = createServer(async (req, res) => {
 
 		if (path === "/health" && req.method === "GET") {
 			return sendJson(res, {
-				// Backwards-compatible capability flag used by existing consumers;
-				// modelResident reports whether native weights are currently warm.
-				modelLoaded: true,
-				modelResident: tts !== null,
-				modelLoading: modelLoadPromise !== null,
+				...modelHealthState({
+					resident: tts !== null,
+					loading: modelLoadPromise !== null,
+				}),
 				dtype: DTYPE,
 				voice: DEFAULT_VOICE,
 				voiceCount: KNOWN_VOICES.length,

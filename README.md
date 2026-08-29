@@ -1,7 +1,8 @@
 # pi-voice-server
 
-Minimal **Kokoro-82M** TTS HTTP server. Loads one ONNX model on startup, keeps
-it warm during a synthesis burst, and serves speech over a tiny REST surface.
+Minimal **Kokoro-82M** TTS HTTP server. Lazily loads one ONNX model for
+synthesis, keeps it warm during a burst, and serves speech over a tiny REST
+surface.
 Production uses systemd socket activation, loads the model only for synthesis,
 and shuts the model process down after ten idle minutes so ONNX inference
 arenas do not retain RAM indefinitely.
@@ -30,10 +31,14 @@ Systemd's socket queues a request while the lightweight process starts.
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| `GET` | `/health` | — | capability plus `modelResident`/`modelLoading`, dtype and voice metadata |
+| `GET` | `/health` | — | capability, residency/loading, dtype and voice metadata |
 | `GET` | `/voices` | — | `{ voices: string[] }` (28 Kokoro voices) |
 | `POST` | `/tts` | `{ text, voice?, speed? }` | `audio/wav` — whole blob, all chunks concatenated |
 | `POST` | `/tts/stream` | `{ text, voice?, speed? }` | `application/octet-stream` — chunked binary frame stream |
+
+`modelAvailable` reports that this process can serve synthesis without loading
+weights. `modelLoaded` and its clearer alias `modelResident` are true only while
+the native model is warm; `modelLoading` reports an in-progress cold load.
 
 ### Streaming (`/tts/stream`)
 
