@@ -457,14 +457,11 @@ const server = createServer(async (req, res) => {
 					const audio = await activeTts.generate(chunks[i], { voice, speed });
 					if (clientGone) throw new HttpError(499, "client disconnected");
 					sampleRate = audio.sampling_rate;
+					// The whole-blob endpoint returns one continuous WAV. Kokoro's
+					// generated audio already contains natural sentence/paragraph
+					// timing, so do not add an artificial inter-chunk pause here.
 					parts.push(audio.audio);
 					estimatedWavBytes += audio.audio.length * 2;
-					// ~200ms silence between chunks so sentences don't run together.
-					if (i < chunks.length - 1) {
-						const silence = new Float32Array(Math.floor(sampleRate * 0.2));
-						parts.push(silence);
-						estimatedWavBytes += silence.length * 2;
-					}
 					if (estimatedWavBytes > MAX_AUDIO_BYTES) {
 						throw new HttpError(413, `generated audio exceeds KOKORO_MAX_AUDIO_BYTES (${estimatedWavBytes} > ${MAX_AUDIO_BYTES})`);
 					}
