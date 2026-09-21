@@ -37,6 +37,7 @@ import {
 	readBody,
 	writeWithBackpressure,
 } from "./lib/http-utils.mjs";
+import { charSplit, rampBudgetFor, steadyBudget } from "./lib/chunker.mjs";
 import {
 	createIdleShutdownTimer,
 	modelHealthState,
@@ -224,8 +225,8 @@ function sendJson(res, data, status = 200) {
 // 4/29 chunks silently truncated under the old 500-char cap. So we split on
 // ACTUAL phoneme-token count: phonemize each char-budgeted chunk, tokenize it
 // WITHOUT truncation (to read its true length), and re-split on word
-// boundaries anything over the safe limit.
-const CHUNK_MAX_CHARS = 500; // first-pass char budget (keeps paragraph/sentence/word boundaries)
+// boundaries anything over the safe limit. The char-level split and the chunk
+// sizing policies live in lib/chunker.mjs.
 const SAFE_TOKEN_LIMIT = 480; // phoneme tokens; ~30 under the ~510 content cap → margin for safety
 
 /**
@@ -316,11 +317,12 @@ async function splitByTokenBudget(chunk, lang = "a") {
  *   2) a token-aware pass that measures each chunk's phoneme tokens and
  *      re-splits any that exceed SAFE_TOKEN_LIMIT.
  * `voice` selects the phonemization language (a*=en-us, b*=en-gb), matching
- * what kokoro-js itself uses.
+ * what kokoro-js itself uses. `nextBudget` picks the chunk sizing policy — see
+ * lib/chunker.mjs for the steady and ramped ones and why the ramp exists.
  */
-async function chunkText(text, voice = DEFAULT_VOICE) {
+async function chunkTextWith(text, voice, nextBudget) {
 	const lang = voice.at(0) === "b" ? "b" : "a";
-	const charChunks = charSplit(text, CHUNK_MAX_CHARS);
+	const charChunks = charSplit(text, nextBudget);
 	const out = [];
 	for (const ch of charChunks) {
 		if ((await phonemeTokenCount(ch, lang)) <= SAFE_TOKEN_LIMIT) {
@@ -333,61 +335,20 @@ async function chunkText(text, voice = DEFAULT_VOICE) {
 }
 
 /**
- * Pure synchronous char-budget splitter (paragraph → sentence → word wrap).
- * Extracted from the original chunkText so the token-aware pass above can
- * start from good boundaries before measuring phoneme tokens.
+ * Uniform chunking: used by the whole-blob route, which returns one WAV only
+ * after every chunk is synthesized, so a smaller opening chunk buys it nothing.
  */
-function charSplit(text, maxChars) {
-	const clean = text.replace(/\r\n/g, "\n").trim();
-	if (!clean) return [];
-	if (clean.length <= maxChars) return [clean];
+async function chunkText(text, voice = DEFAULT_VOICE) {
+	return chunkTextWith(text, voice, steadyBudget);
+}
 
-	const chunks = [];
-	const pushIf = (s) => {
-		const t = s.trim();
-		if (t) chunks.push(t);
-	};
-
-	// Split on blank lines (paragraphs) first.
-	for (const para of clean.split(/\n\s*\n/)) {
-		if (para.length <= maxChars) {
-			pushIf(para);
-			continue;
-		}
-		// Paragraph too big: split on sentence enders, keeping punctuation.
-		const sentences = para.match(/[^.!?]*[.!?]+(?:["')\]]+)?|[^.!?]+$/g) ?? [para];
-		let buf = "";
-		for (const sent of sentences) {
-			const s = sent.trim();
-			if (!s) continue;
-			if (s.length > maxChars) {
-				// Single sentence longer than budget: flush, then hard-wrap by word.
-				if (buf) {
-					pushIf(buf);
-					buf = "";
-				}
-				let wbuf = "";
-				for (const w of s.split(/\s+/)) {
-					if ((wbuf + " " + w).trim().length > maxChars) {
-						pushIf(wbuf);
-						wbuf = w;
-					} else {
-						wbuf = (wbuf + " " + w).trim();
-					}
-				}
-				if (wbuf) pushIf(wbuf);
-				continue;
-			}
-			if ((buf + " " + s).length > maxChars) {
-				pushIf(buf);
-				buf = s;
-			} else {
-				buf = (buf + " " + s).trim();
-			}
-		}
-		if (buf) pushIf(buf);
-	}
-	return chunks;
+/**
+ * Ramped chunking: used by the streaming route so the first sound arrives after
+ * ~100 chars instead of after a whole steady-cap chunk. Growth is bounded per
+ * chunk to keep the queue from running dry — see lib/chunker.mjs.
+ */
+async function chunkTextForStream(text, voice = DEFAULT_VOICE) {
+	return chunkTextWith(text, voice, rampBudgetFor(text));
 }
 
 // Serialize /tts calls — Kokoro synthesis is not concurrency-safe on one model.
@@ -522,7 +483,7 @@ const server = createServer(async (req, res) => {
 				try {
 					if (clientGone) return;
 					const activeTts = await ensureModel();
-					const chunks = await chunkText(text, voice);
+					const chunks = await chunkTextForStream(text, voice);
 					log(`tts/stream: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 					let sampleRate = 0;
 					for (let i = 0; i < chunks.length; i++) {
@@ -530,16 +491,13 @@ const server = createServer(async (req, res) => {
 						const out = await activeTts.generate(chunks[i], { voice, speed });
 						sampleRate = out.sampling_rate;
 						let samples = out.audio;
-						// Bake ~200ms of trailing silence into every chunk except
-						// the last, so sentences don't run together when the
-						// client chains the WAVs back to back.
-						if (i < chunks.length - 1) {
-							const sil = new Float32Array(Math.floor(sampleRate * 0.2));
-							const cat = new Float32Array(samples.length + sil.length);
-							cat.set(samples, 0);
-							cat.set(sil, samples.length);
-							samples = cat;
-						}
+						// No artificial inter-chunk silence: it existed for the old client
+						// that chained WAVs through a media element, and Kokoro's own audio
+						// already carries natural sentence timing (same reasoning as the
+						// whole-blob route). The streaming client schedules chunks on a
+						// sample-accurate timeline, so a baked-in pause is an invented
+						// one — and the ramped chunking above makes the opening chunks
+						// small, so there are more boundaries for it to sit in.
 						await writeFrame(0x01, float32ToWav(samples, sampleRate));
 					}
 					if (!clientGone) await writeFrame(0x00, null); // END
