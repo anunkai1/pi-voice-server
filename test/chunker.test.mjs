@@ -193,6 +193,18 @@ function describe_chunker() {
 		for (const c of chunks) assert.ok(c.length > 30, `tiny chunk: ${c.length}`);
 	});
 
+	test("a sentence just over the cap leaves no orphan chunk", () => {
+		// The case that bit the deployed ramp: a 121-char opening sentence against
+		// the 120-char sentence cap word-wraps, and pushing the ~20-char tail on
+		// its own made a chunk that was far too short to speak.
+		const opener = singleSentence(FIRST_SENTENCE_MAX_CHARS + 1);
+		const text = `${opener} ${paragraph(4, 90)}`;
+		const chunks = charSplit(text, rampBudgetFor(text));
+		assert.ok(chunks[0].length <= FIRST_CHUNK_MAX_CHARS);
+		assert.ok(chunks[1].length > 60, `orphan chunk: ${chunks[1].length} chars`);
+		assert.equal(chunks.join(" "), text);
+	});
+
 	test("openingChunkBudget handles text with no sentence end at all", () => {
 		assert.equal(openingChunkBudget("one long clause with no punctuation at all"), FIRST_CHUNK_MAX_CHARS);
 		assert.equal(openingChunkBudget("Short opener. Then more text follows."), 13);
