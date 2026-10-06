@@ -13,7 +13,7 @@
     "phonemizer": "1.2.1"
   },
   "overrides": {
-    "sharp": "^0.35.4"
+    "sharp": "^0.35.5"
   },
   "allowScripts": {
     "onnxruntime-node@1.21.0": true,
