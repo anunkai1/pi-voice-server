@@ -25,9 +25,6 @@
  */
 
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { KokoroTTS } from "kokoro-js";
 import { phonemize } from "phonemizer";
 import {
@@ -70,20 +67,9 @@ const KNOWN_VOICES = [
 
 let tts = null;
 let modelLoadPromise = null;
-const stateFile = resolve(homedir(), ".pi", "voice", "server-state.json");
 
 function log(...args) {
 	console.log("[kokoro-tts]", ...args);
-}
-
-function saveState(s) {
-	try {
-		const dir = resolve(homedir(), ".pi", "voice");
-		mkdirSync(dir, { recursive: true });
-		writeFileSync(stateFile, `${JSON.stringify(s, null, 2)}\n`);
-	} catch {
-		/* best-effort */
-	}
 }
 
 async function loadModel() {
@@ -97,7 +83,6 @@ async function loadModel() {
 	}
 	tts = loaded;
 	log(`model ready in ${Date.now() - t0}ms — ${voices.length} voices available`);
-	saveState({ modelLoaded: true, dtype: DTYPE, voices, at: new Date().toISOString() });
 	return loaded;
 }
 
@@ -115,41 +100,8 @@ async function ensureModel() {
 	}
 }
 
-/** Float32 PCM → 16-bit little-endian PCM WAV Buffer. */
-function float32ToWav(samples, sampleRate) {
-	const numChannels = 1;
-	const bitsPerSample = 16;
-	const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-	const blockAlign = numChannels * (bitsPerSample / 8);
-	const dataSize = samples.length * (bitsPerSample / 8);
-	if (44 + dataSize > MAX_AUDIO_BYTES) {
-		throw new HttpError(413, `generated audio exceeds KOKORO_MAX_AUDIO_BYTES (${44 + dataSize} > ${MAX_AUDIO_BYTES})`);
-	}
-	const buf = Buffer.alloc(44 + dataSize);
-	buf.write("RIFF", 0);
-	buf.writeUInt32LE(36 + dataSize, 4);
-	buf.write("WAVE", 8);
-	buf.write("fmt ", 12);
-	buf.writeUInt32LE(16, 16);
-	buf.writeUInt16LE(1, 20); // PCM
-	buf.writeUInt16LE(numChannels, 22);
-	buf.writeUInt32LE(sampleRate, 24);
-	buf.writeUInt32LE(byteRate, 28);
-	buf.writeUInt16LE(blockAlign, 32);
-	buf.writeUInt16LE(bitsPerSample, 34);
-	buf.write("data", 36);
-	buf.writeUInt32LE(dataSize, 40);
-	let off = 44;
-	for (let i = 0; i < samples.length; i++) {
-		const s = Math.max(-1, Math.min(1, samples[i] ?? 0));
-		buf.writeInt16LE(Math.round(s * 0x7fff), off);
-		off += 2;
-	}
-	return buf;
-}
-
-/** Convert multiple PCM parts directly into one WAV without first allocating
- * a second merged Float32Array. This halves the large-response copy overhead. */
+/** Float32 PCM parts → one 16-bit little-endian mono PCM WAV Buffer, without first
+ * allocating a merged Float32Array. */
 function float32PartsToWav(parts, sampleRate) {
 	const totalSamples = parts.reduce((sum, part) => sum + part.length, 0);
 	const dataSize = totalSamples * 2;
@@ -498,7 +450,7 @@ const server = createServer(async (req, res) => {
 						// sample-accurate timeline, so a baked-in pause is an invented
 						// one — and the ramped chunking above makes the opening chunks
 						// small, so there are more boundaries for it to sit in.
-						await writeFrame(0x01, float32ToWav(samples, sampleRate));
+						await writeFrame(0x01, float32PartsToWav([samples], sampleRate));
 					}
 					if (!clientGone) await writeFrame(0x00, null); // END
 				} catch (err) {
