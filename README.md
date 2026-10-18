@@ -42,8 +42,11 @@ the native model is warm; `modelLoading` reports an in-progress cold load.
 
 ### Streaming (`/tts/stream`)
 
-Long text is split into ≤500-char chunks (Kokoro's phoneme encoder has a fixed
-~510-token window — anything past it is silently dropped). The non-streaming
+Long text is split into chunks of whole sentences, never mid-sentence, since
+each chunk is spoken as a complete utterance: the first sentence alone, then
+growing chunks of up to 500 characters. Kokoro's phoneme encoder has a fixed
+~510-token window (anything past it is silently dropped), so the rare sentence
+over it is split at a comma or semicolon. The non-streaming
 `/tts` synthesizes all chunks then concatenates them into one WAV before
 responding. `/tts/stream` instead writes each chunk's WAV **the moment it's
 synthesized**, so the client can start playing the first chunk while later

@@ -34,7 +34,7 @@ import {
 	readBody,
 	writeWithBackpressure,
 } from "./lib/http-utils.mjs";
-import { charSplit, rampBudgetFor, steadyBudget } from "./lib/chunker.mjs";
+import { charSplit } from "./lib/chunker.mjs";
 import {
 	createIdleShutdownTimer,
 	modelHealthState,
@@ -177,8 +177,8 @@ function sendJson(res, data, status = 200) {
 // 4/29 chunks silently truncated under the old 500-char cap. So we split on
 // ACTUAL phoneme-token count: phonemize each char-budgeted chunk, tokenize it
 // WITHOUT truncation (to read its true length), and re-split on word
-// boundaries anything over the safe limit. The char-level split and the chunk
-// sizing policies live in lib/chunker.mjs.
+// boundaries anything over the safe limit. The sentence split and chunk sizing
+// live in lib/chunker.mjs.
 const SAFE_TOKEN_LIMIT = 480; // phoneme tokens; ~30 under the ~510 content cap → margin for safety
 
 /**
@@ -224,12 +224,34 @@ async function phonemeTokenCount(text, lang = "a") {
 }
 
 /**
- * Re-split a single char-budgeted chunk that measured OVER the token limit,
- * greedily packing words until adding the next would cross SAFE_TOKEN_LIMIT.
- * A lone word whose own tokens exceed the limit (vanishingly rare — e.g. a
- * long URL with no spaces) is hard-split by characters, each half re-checked.
+ * Re-split a chunk that measured OVER the token limit — in practice a single
+ * very long sentence. Clauses (cut after , ; :) are packed first, so the break
+ * falls where a speaker would pause; a clause still over the limit is packed by
+ * words, and a lone word over it (e.g. a long URL) is hard-split by characters.
  */
 async function splitByTokenBudget(chunk, lang = "a") {
+	const pieces = [];
+	let buf = "";
+	for (const clause of chunk.split(/(?<=[,;:])\s+/)) {
+		const cand = buf ? `${buf} ${clause}` : clause;
+		if ((await phonemeTokenCount(cand, lang)) <= SAFE_TOKEN_LIMIT) {
+			buf = cand;
+			continue;
+		}
+		if (buf) pieces.push(buf);
+		buf = "";
+		if ((await phonemeTokenCount(clause, lang)) <= SAFE_TOKEN_LIMIT) {
+			buf = clause;
+		} else {
+			pieces.push(...(await splitWordsByTokenBudget(clause, lang)));
+		}
+	}
+	if (buf) pieces.push(buf);
+	return pieces;
+}
+
+/** Pack words under SAFE_TOKEN_LIMIT; hard-split any single word over it. */
+async function splitWordsByTokenBudget(chunk, lang) {
 	const pieces = [];
 	let buf = "";
 	for (const w of chunk.split(/\s+/).filter(Boolean)) {
@@ -264,17 +286,16 @@ async function splitByTokenBudget(chunk, lang = "a") {
 
 /**
  * Split `text` into chunks each safe for Kokoro's context window. Two passes:
- *   1) hierarchical char-based split (paragraph → sentence → word) for
- *      natural boundaries and to keep most chunks intact, then
+ *   1) whole sentences packed into ramped chunks (lib/chunker.mjs), then
  *   2) a token-aware pass that measures each chunk's phoneme tokens and
  *      re-splits any that exceed SAFE_TOKEN_LIMIT.
  * `voice` selects the phonemization language (a*=en-us, b*=en-gb), matching
- * what kokoro-js itself uses. `nextBudget` picks the chunk sizing policy — see
- * lib/chunker.mjs for the steady and ramped ones and why the ramp exists.
+ * what kokoro-js itself uses. Both routes use it: the ramp only matters when
+ * streaming, and costs the whole-blob route nothing.
  */
-async function chunkTextWith(text, voice, nextBudget) {
+async function chunkText(text, voice = DEFAULT_VOICE) {
 	const lang = voice.at(0) === "b" ? "b" : "a";
-	const charChunks = charSplit(text, nextBudget);
+	const charChunks = charSplit(text);
 	const out = [];
 	for (const ch of charChunks) {
 		if ((await phonemeTokenCount(ch, lang)) <= SAFE_TOKEN_LIMIT) {
@@ -284,23 +305,6 @@ async function chunkTextWith(text, voice, nextBudget) {
 		}
 	}
 	return out;
-}
-
-/**
- * Uniform chunking: used by the whole-blob route, which returns one WAV only
- * after every chunk is synthesized, so a smaller opening chunk buys it nothing.
- */
-async function chunkText(text, voice = DEFAULT_VOICE) {
-	return chunkTextWith(text, voice, steadyBudget);
-}
-
-/**
- * Ramped chunking: used by the streaming route so the first sound arrives after
- * ~100 chars instead of after a whole steady-cap chunk. Growth is bounded per
- * chunk to keep the queue from running dry — see lib/chunker.mjs.
- */
-async function chunkTextForStream(text, voice = DEFAULT_VOICE) {
-	return chunkTextWith(text, voice, rampBudgetFor(text));
 }
 
 // Serialize /tts calls — Kokoro synthesis is not concurrency-safe on one model.
@@ -435,7 +439,7 @@ const server = createServer(async (req, res) => {
 				try {
 					if (clientGone) return;
 					const activeTts = await ensureModel();
-					const chunks = await chunkTextForStream(text, voice);
+					const chunks = await chunkText(text, voice);
 					log(`tts/stream: chars=${text.length} chunks=${chunks.length} voice=${voice} speed=${speed}`);
 					let sampleRate = 0;
 					for (let i = 0; i < chunks.length; i++) {
