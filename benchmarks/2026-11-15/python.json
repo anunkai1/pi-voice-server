@@ -56,5 +56,8 @@
   "memory": [
     "VmHWM:\t 1675868 kB",
     "VmRSS:\t 1520508 kB"
-  ]
+  ],
+  "installedBytes": 1566742932,
+  "installedSizeMethod": "du -sb immutable runtime release, excluding shared system interpreter, download caches and rollback copies",
+  "release": "v3-5c2e3bb28d140dfce8360962eee3da01f037dd22"
 }

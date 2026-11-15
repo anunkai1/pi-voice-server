@@ -28,21 +28,21 @@ Python generates duration metadata internally even for legacy requests.
 | Warm paragraph synthesis, median of 3 | 9.191 s | 6.559 s |
 | Peak process RSS (`/proc/PID/status:VmHWM`) | 817.9 MiB | 1636.6 MiB |
 | RSS after all trials (`VmRSS`) | 817.9 MiB | 1484.9 MiB |
-| Installed dependencies + weights, apparent size | 0.557 GB | 1.626 GB |
+| Installed runtime including weights, apparent size | 0.557 GB | 1.567 GB |
 
-Installed-size method: `du -sb` of the existing pruned immutable JS release
-(556,653,732 bytes, including its q4 model), compared with the installed Python
-`.venv` (1,284,521,289 bytes) plus staged `model` (341,893,780 bytes). Neither
-counts the system Node/Python interpreter, shared download caches or rollback
-copies. Tiny server/source files do not materially change the rounded figures.
+Installed-size method: `du -sb` of the pruned immutable JS release
+(556,653,732 bytes, including its q4 model) and the final immutable Python release
+(1,566,742,932 bytes, including all weights/voices and relocated eSpeak data).
+Neither counts the system Node/Python interpreter, shared download caches or
+rollback copies. Exact release IDs and byte counts are in the JSON.
 Python model packs include every advertised voice, not only the benchmark one.
-The packaging fix moves eSpeak's data out of `.venv` to the release root without
-copying it; count that directory too when repeating the installed-size measurement.
+The source development environment used for the timings is larger than the fresh
+release because it retains generated/import caches; its size is not used here.
 
 **Conclusion:** Python was about 27% faster warm for the short text and 29%
 faster warm for the paragraph here. Its first complete WAV was about 3.2×
 slower from a fresh process; peak RSS was about 2× higher, installed runtime
-about 2.9× larger. This does not establish streaming time-to-first-audio or
+about 2.8× larger. This does not establish streaming time-to-first-audio or
 subjective Relay responsiveness; the owner still needs to judge those.
 
 Reproduce against an old immutable JS release (or a checkout of the baseline
@@ -64,4 +64,8 @@ because the final nested package path exceeded its native path-length limit.
 The explicit rollback command restored JS successfully. Packaging now moves
 that data (without duplication) to the release root and smoke-tests the final,
 read-only release path before switching. The injected post-health transaction
-failure also restored the previous JS unit/release successfully.
+failure also restored the previous JS unit/release successfully. A final explicit
+rollback round-trip verified actual q4 WAV synthesis, then reinstalled Python.
+`consumers.jsonl` records real ACB whole/stream synthesis and the deployed
+KidStories narration runner using a simulated Ming failure and real Kokoro
+fallback, without changing any live book or job.
