@@ -13,7 +13,7 @@ shared host, not statistically isolated CPU benchmarks.
 
 Baseline: kokoro-js/q4 at source commit
 `2918820b7031c17f3f5df833c9b736fcfb41d566`, its existing ONNX defaults.
-Python: kokoro 0.9.4, Torch 2.8.0+cpu, pinned upstream model,
+Python: kokoro 0.9.4, Torch 2.13.0+cpu, pinned upstream model,
 `KOKORO_THREADS=4`, `HF_HUB_OFFLINE=1`, local staged weights. Both return full
 mono PCM16 24 kHz WAVs. Output lengths differ slightly because phonemisation and
 model precision differ (4.500 vs 4.350 s short; 21.425 vs 21.375 s paragraph).
@@ -21,25 +21,25 @@ Python generates duration metadata internally even for legacy requests.
 
 | Measurement | kokoro-js q4 | Python fp32 |
 |---|---:|---:|
-| Process → health ready | 0.250 s | 0.170 s |
-| Cold first short synthesis HTTP request | 2.562 s | 6.011 s |
-| Process → first complete short WAV | 2.812 s | 6.181 s |
-| Warm short synthesis, median of 3 | 1.821 s | 1.259 s |
-| Warm paragraph synthesis, median of 3 | 9.191 s | 6.727 s |
-| Peak process RSS (`/proc/PID/status:VmHWM`) | 817.9 MiB | 1844.0 MiB |
-| RSS after all trials (`VmRSS`) | 817.9 MiB | 1657.8 MiB |
-| Installed dependencies + weights, apparent size | 0.557 GB | 1.599 GB |
+| Process → health ready | 0.250 s | 0.221 s |
+| Cold first short synthesis HTTP request | 2.562 s | 8.727 s |
+| Process → first complete short WAV | 2.812 s | 8.948 s |
+| Warm short synthesis, median of 3 | 1.821 s | 1.326 s |
+| Warm paragraph synthesis, median of 3 | 9.191 s | 6.559 s |
+| Peak process RSS (`/proc/PID/status:VmHWM`) | 817.9 MiB | 1636.6 MiB |
+| RSS after all trials (`VmRSS`) | 817.9 MiB | 1484.9 MiB |
+| Installed dependencies + weights, apparent size | 0.557 GB | 1.626 GB |
 
 Installed-size method: `du -sb` of the existing pruned immutable JS release
 (556,653,732 bytes, including its q4 model), compared with the installed Python
-`.venv` (1,257,207,694 bytes) plus staged `model` (341,893,780 bytes). Neither
+`.venv` (1,284,521,289 bytes) plus staged `model` (341,893,780 bytes). Neither
 counts the system Node/Python interpreter, shared download caches or rollback
 copies. Tiny server/source files do not materially change the rounded figures.
 Python model packs include every advertised voice, not only the benchmark one.
 
-**Conclusion:** Python was about 31% faster warm for the short text and 27%
-faster warm for the paragraph here. Its first complete WAV was about 2.2×
-slower from a fresh process; peak RSS was about 2.25× higher, installed runtime
+**Conclusion:** Python was about 27% faster warm for the short text and 29%
+faster warm for the paragraph here. Its first complete WAV was about 3.2×
+slower from a fresh process; peak RSS was about 2× higher, installed runtime
 about 2.9× larger. This does not establish streaming time-to-first-audio or
 subjective Relay responsiveness; the owner still needs to judge those.
 

@@ -4,57 +4,57 @@
     "server.py"
   ],
   "method": "fresh process; cached weights; af_heart speed=1; three warm requests, median; 4 Python Torch threads; no Server4",
-  "healthReadySeconds": 0.16953910900338087,
+  "healthReadySeconds": 0.22120248000283027,
   "coldShort": {
-    "seconds": 6.011443126997619,
+    "seconds": 8.726827569997113,
     "audioSeconds": 4.35,
-    "rtf": 1.381940948735085
+    "rtf": 2.006167257470601
   },
-  "processToFirstWavSeconds": 6.181110918005288,
+  "processToFirstWavSeconds": 8.948134491998644,
   "short": {
     "text": "Hello. I can speak to you while the tools keep working.",
     "trials": [
       {
-        "seconds": 1.2654784719998133,
+        "seconds": 1.3354532250014017,
         "audioSeconds": 4.35,
-        "rtf": 0.29091459126432495
+        "rtf": 0.3070007413796326
       },
       {
-        "seconds": 1.2536717719995067,
+        "seconds": 1.325878764000663,
         "audioSeconds": 4.35,
-        "rtf": 0.28820040735620844
+        "rtf": 0.30479971586222143
       },
       {
-        "seconds": 1.2590850150008919,
+        "seconds": 1.2972768320032628,
         "audioSeconds": 4.35,
-        "rtf": 0.2894448310346878
+        "rtf": 0.2982245590812099
       }
     ],
-    "medianSeconds": 1.2590850150008919
+    "medianSeconds": 1.325878764000663
   },
   "paragraph": {
     "text": "The garden was quiet after the rain. A small bird landed beside the water bowl and watched the morning light move across the fence. Inside the house, someone opened a window and put the kettle on. There was no need to hurry today. We could finish the useful work first, take a short break, and come back with a clearer idea of what mattered most.",
     "trials": [
       {
-        "seconds": 6.727243044006173,
+        "seconds": 6.856420625997998,
         "audioSeconds": 21.375,
-        "rtf": 0.3147248207722186
+        "rtf": 0.320768216420959
       },
       {
-        "seconds": 6.4755114180006785,
+        "seconds": 6.558563225000398,
         "audioSeconds": 21.375,
-        "rtf": 0.302947902596523
+        "rtf": 0.30683336725148064
       },
       {
-        "seconds": 8.296367324997846,
+        "seconds": 6.5395852780056885,
         "audioSeconds": 21.375,
-        "rtf": 0.3881341438595483
+        "rtf": 0.3059455100821375
       }
     ],
-    "medianSeconds": 6.727243044006173
+    "medianSeconds": 6.558563225000398
   },
   "memory": [
-    "VmHWM:\t 1888252 kB",
-    "VmRSS:\t 1697576 kB"
+    "VmHWM:\t 1675868 kB",
+    "VmRSS:\t 1520508 kB"
   ]
 }

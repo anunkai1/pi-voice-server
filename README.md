@@ -71,7 +71,9 @@ or its played-prefix recording. That browser/extension integration is separate.
 
 Python 3.12; CPU-only Torch and dependencies are pinned in `uv.lock`. `prepare_model.py`
 stages the model config/weights and all 28 voice packs at a pinned Hugging Face
-revision into `model/`. Runtime inference uses those files; the service sets
+revision into `model/`. Deployment audits installed packages and explicitly audits
+Torch's upstream version (the vulnerability feed does not match its `+cpu` tag);
+the hash-pinned spaCy English model is not covered by the PyPI vulnerability feed. Runtime inference uses those files; the service sets
 `HF_HUB_OFFLINE=1`. Staging tests synthesis before the immutable release switch.
 No model download is permitted/required by the sandboxed live process.
 
@@ -82,6 +84,7 @@ uv sync --frozen
 KOKORO_PORT=18181 HF_HUB_OFFLINE=1 .venv/bin/python server.py
 .venv/bin/python verify_contract.py http://127.0.0.1:18181
 .venv/bin/python verify_lifecycle.py
+node verify_consumers.mjs http://127.0.0.1:3500
 ```
 
 The runtime honours systemd's inherited `tts` FD (loopback only); outside
