@@ -1,0 +1,60 @@
+{
+  "command": [
+    "node",
+    "server.mjs"
+  ],
+  "method": "fresh process; cached weights; af_heart speed=1; three warm requests, median; 4 Python Torch threads; no Server4",
+  "healthReadySeconds": 0.24968339200131595,
+  "coldShort": {
+    "seconds": 2.5619669769948814,
+    "audioSeconds": 4.5,
+    "rtf": 0.5693259948877514
+  },
+  "processToFirstWavSeconds": 2.811740021999867,
+  "short": {
+    "text": "Hello. I can speak to you while the tools keep working.",
+    "trials": [
+      {
+        "seconds": 1.8265898739991826,
+        "audioSeconds": 4.5,
+        "rtf": 0.40590886088870726
+      },
+      {
+        "seconds": 1.8097928960050922,
+        "audioSeconds": 4.5,
+        "rtf": 0.4021761991122427
+      },
+      {
+        "seconds": 1.8207497769981273,
+        "audioSeconds": 4.5,
+        "rtf": 0.40461106155513943
+      }
+    ],
+    "medianSeconds": 1.8207497769981273
+  },
+  "paragraph": {
+    "text": "The garden was quiet after the rain. A small bird landed beside the water bowl and watched the morning light move across the fence. Inside the house, someone opened a window and put the kettle on. There was no need to hurry today. We could finish the useful work first, take a short break, and come back with a clearer idea of what mattered most.",
+    "trials": [
+      {
+        "seconds": 7.750548732998141,
+        "audioSeconds": 21.425,
+        "rtf": 0.36175256630096336
+      },
+      {
+        "seconds": 9.242426787997829,
+        "audioSeconds": 21.425,
+        "rtf": 0.43138514763117053
+      },
+      {
+        "seconds": 9.190783080004621,
+        "audioSeconds": 21.425,
+        "rtf": 0.4289747061845797
+      }
+    ],
+    "medianSeconds": 9.190783080004621
+  },
+  "memory": [
+    "VmHWM:\t  837496 kB",
+    "VmRSS:\t  837496 kB"
+  ]
+}

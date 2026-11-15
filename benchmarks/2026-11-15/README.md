@@ -1,0 +1,58 @@
+# Server2 comparison — 15/11/2026 (AEST)
+
+CPU: Intel Core i5-1135G7, 4 physical cores / 8 threads. No Server4 involved.
+
+`benchmark.py` starts a fresh process on loopback 18181, waits for health, then
+requests `/tts` with af_heart, speed 1: one cold short request followed by three
+warm short and three warm paragraph requests. Texts and every trial are in the
+raw JSON. Warm figures below are medians; cold figures are single trials.
+Weights were cached before both trials; OS page cache was not flushed. Thus
+“cold” means process/model cold, **not** first-time downloading or cold disk.
+No other benchmark synthesis was run concurrently. These are observations on a
+shared host, not statistically isolated CPU benchmarks.
+
+Baseline: kokoro-js/q4 at source commit
+`2918820b7031c17f3f5df833c9b736fcfb41d566`, its existing ONNX defaults.
+Python: kokoro 0.9.4, Torch 2.8.0+cpu, pinned upstream model,
+`KOKORO_THREADS=4`, `HF_HUB_OFFLINE=1`, local staged weights. Both return full
+mono PCM16 24 kHz WAVs. Output lengths differ slightly because phonemisation and
+model precision differ (4.500 vs 4.350 s short; 21.425 vs 21.375 s paragraph).
+Python generates duration metadata internally even for legacy requests.
+
+| Measurement | kokoro-js q4 | Python fp32 |
+|---|---:|---:|
+| Process → health ready | 0.250 s | 0.170 s |
+| Cold first short synthesis HTTP request | 2.562 s | 6.011 s |
+| Process → first complete short WAV | 2.812 s | 6.181 s |
+| Warm short synthesis, median of 3 | 1.821 s | 1.259 s |
+| Warm paragraph synthesis, median of 3 | 9.191 s | 6.727 s |
+| Peak process RSS (`/proc/PID/status:VmHWM`) | 817.9 MiB | 1844.0 MiB |
+| RSS after all trials (`VmRSS`) | 817.9 MiB | 1657.8 MiB |
+| Installed dependencies + weights, apparent size | 0.557 GB | 1.599 GB |
+
+Installed-size method: `du -sb` of the existing pruned immutable JS release
+(556,653,732 bytes, including its q4 model), compared with the installed Python
+`.venv` (1,257,207,694 bytes) plus staged `model` (341,893,780 bytes). Neither
+counts the system Node/Python interpreter, shared download caches or rollback
+copies. Tiny server/source files do not materially change the rounded figures.
+Python model packs include every advertised voice, not only the benchmark one.
+
+**Conclusion:** Python was about 31% faster warm for the short text and 27%
+faster warm for the paragraph here. Its first complete WAV was about 2.2×
+slower from a fresh process; peak RSS was about 2.25× higher, installed runtime
+about 2.9× larger. This does not establish streaming time-to-first-audio or
+subjective Relay responsiveness; the owner still needs to judge those.
+
+Reproduce against an old immutable JS release (or a checkout of the baseline
+with `npm ci`) and a prepared Python checkout, sequentially:
+
+```
+python3 benchmark.py --output /tmp/kokoro-js.json -- node /path/to/js-release/server.mjs
+HF_HUB_OFFLINE=1 python3 benchmark.py --output /tmp/kokoro-python.json -- .venv/bin/python server.py
+```
+
+`contract.json` records actual opt-in model-duration timings, `voices.json`
+records synthesis with all 28 advertised voices, and `lifecycle.json` records
+inherited-FD activation and successful idle exit after the 60-second minimum.
+The original JS utility test suite passed all 17 tests before retiring the JS
+backend; the Python contract suite is now `python -m unittest -v`.

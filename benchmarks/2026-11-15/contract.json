@@ -1,0 +1,38 @@
+{
+  "contract": "PASS",
+  "legacyFrames": [
+    1,
+    1,
+    0
+  ],
+  "alignmentExample": {
+    "text": "Hello world.",
+    "words": [
+      {
+        "text": "Hello",
+        "whitespace": " ",
+        "startSample": 8400,
+        "endSample": 15000
+      },
+      {
+        "text": "world",
+        "whitespace": "",
+        "startSample": 15000,
+        "endSample": 31200
+      },
+      {
+        "text": ".",
+        "whitespace": "",
+        "startSample": 31200,
+        "endSample": 35400
+      }
+    ],
+    "unalignedTokens": [],
+    "alignmentComplete": true,
+    "startSample": 0,
+    "endSample": 37800,
+    "sampleRate": 24000,
+    "alignment": "kokoro-pred-dur-v1",
+    "submittedText": "Hello world."
+  }
+}

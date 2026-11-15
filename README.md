@@ -1,127 +1,118 @@
 # pi-voice-server
 
-Minimal **Kokoro-82M** TTS HTTP server. Lazily loads one ONNX model for
-synthesis, keeps it warm during a burst, and serves speech over a tiny REST
-surface.
-Production uses systemd socket activation, loads the model only for synthesis,
-and shuts the model process down after ten idle minutes so ONNX inference
-arenas do not retain RAM indefinitely.
+Single CPU Python Kokoro 82M service on Server2 loopback 8181. Replaces the
+previous kokoro-js/q4 backend without changing existing consumers. The service
+and socket names remain `pi-voice-server.{service,socket}`; the owning deployer
+remains `deploy-pi-voice-server` (tracked in `infra`). No second voice service.
 
-This is the speech backend for [**agentchatbox**](https://github.com/anunkai1/agentchatbox)
-(its `/api/tts` proxies here) and [**kidstories**](https://gitea.mavali.top/admin/kidstories)
-(book narration). agentchatbox's `pi-voice-reply` extension decides *what* to
-say; this server handles *how* to say it.
+## HTTP compatibility
 
-Adapted from [`@s1m0n38/pi-voice`](https://github.com/s1m0n38/pi-voice) (MIT).
-Rewritten to use [`kokoro-js`](https://www.npmjs.com/package/kokoro-js) directly
-— the original `@huggingface/transformers` env flags triggered an
-`onnxruntime-node` native-library path-resolution bug on this box.
+- `GET /health`: status, modelAvailable, modelLoaded/modelResident, modelLoading,
+  dtype (`fp32`), voice, voiceCount, maxTextChars, maxAudioBytes,
+  idleTimeoutMs, activeSyntheses; additionally advertises alignment capability.
+  An unloaded model is available, not unhealthy.
+- `GET /voices`: `{ "voices": [...] }`, the same ordered 28 English voice names,
+  with `af_heart` the default. Both US and British voices use the corresponding
+  upstream English phonemiser. Names/voices remain; pronunciation need not be
+  sample-identical to the former quantised backend.
+- `POST /tts`: JSON `{text, voice?, speed?}` → mono PCM16, 24 kHz WAV.
+- `POST /tts/stream`: identical JSON → `application/octet-stream`.
+  Frames are **one byte type + uint32 LE payload byte length + payload**:
+  DATA=1 carries a complete WAV chunk; END=0 has no payload; ERROR=128 carries a
+  UTF-8 error message and is terminal (not followed by a false successful END).
 
-## Why a separate server?
+Speed range is 0.5–2, default 1. Text is trimmed and limited to 30,000 characters;
+request bodies are limited to 128 KiB and output to 64 MiB by default. Errors are
+JSON before streaming headers, ERROR frames afterwards. Requests are serialised
+across both synthesis routes. Disconnects abandon queued/future chunks; native
+inference already executing finishes before another job uses the model.
 
-Kokoro's ONNX model is ~291 MB and takes ~600 ms to cold-load. Keeping it
-resident through a burst means synthesis is ~1.5 s/sentence instead of
-reloading for every call. Every consumer (agentchatbox, kidstories) shares one
-model over HTTP. Health and voice-list requests never load the model. The first
-synthesis request loads it inside the serial queue, and a ten-minute post-burst
-idle shutdown releases the model and retained native inference workspace.
-Systemd's socket queues a request while the lightweight process starts.
+Text is split at sentence/line boundaries with a ramped chunk budget; official
+KPipeline token-aware splitting handles long sentences. Over-context individual
+tokens are split before inference, never silently truncated.
 
-## Endpoints
+## Optional synthesis alignment
 
-| Method | Path | Body | Returns |
-|---|---|---|---|
-| `GET` | `/health` | — | capability, residency/loading, dtype and voice metadata |
-| `GET` | `/voices` | — | `{ voices: string[] }` (28 Kokoro voices) |
-| `POST` | `/tts` | `{ text, voice?, speed? }` | `audio/wav` — whole blob, all chunks concatenated |
-| `POST` | `/tts/stream` | `{ text, voice?, speed? }` | `application/octet-stream` — chunked binary frame stream |
-
-`modelAvailable` reports that this process can serve synthesis without loading
-weights. `modelLoaded` and its clearer alias `modelResident` are true only while
-the native model is warm; `modelLoading` reports an in-progress cold load.
-
-### Streaming (`/tts/stream`)
-
-Long text is split into chunks of whole sentences, never mid-sentence, since
-each chunk is spoken as a complete utterance: the first sentence alone, then
-growing chunks of up to 500 characters. Kokoro's phoneme encoder has a fixed
-~510-token window (anything past it is silently dropped), so the rare sentence
-over it is split at a comma or semicolon. The non-streaming
-`/tts` synthesizes all chunks then concatenates them into one WAV before
-responding. `/tts/stream` instead writes each chunk's WAV **the moment it's
-synthesized**, so the client can start playing the first chunk while later
-chunks are still being synthesized — turning a ~20 s wait into ~5 s
-time-to-first-sound on a long reply.
-
-Binary frame layout (little-endian), written straight to the body:
+Only `/tts/stream`, **only** when the request includes:
 
 ```
-[1 byte type][uint32 LE length N][N bytes payload]
-  0x01 DATA → payload is one complete WAV file (one text chunk)
-  0x00 END  → no payload; clean end of stream
-  0x80 ERR  → payload is a UTF-8 error message
+X-Kokoro-Alignment: kokoro-pred-dur-v1
 ```
 
-Both `/tts` and `/tts/stream` occupy one slot in the same serial queue — Kokoro
-is not concurrency-safe on a single model instance, so a stream's chunks never
-interleave with a concurrent request. The stream detects client disconnect
-(`res.close`) and stops synthesizing remaining chunks.
+The server echoes that header and emits a type **2 JSON** metadata frame before
+each type 1 WAV. Unknown alignment versions are rejected (400). Without this
+header the old stream has exactly its old frame types; no client migration is
+required. `/tts` remains WAV-only and rejects alignment negotiation.
 
-## Configuration
+Metadata includes `submittedText` (exact trimmed synthesis input, not chat
+Markdown), chunk `text`, `sampleRate:24000`, chunk start/end sample offsets, and
+`words:[{text,whitespace,startSample,endSample}]`. Offsets are absolute within the
+concatenated request audio, **before** WAV headers, including every prior chunk.
+Punctuation may be a separate token. `unalignedTokens` and `alignmentComplete`
+expose missing token mappings rather than inventing timings.
 
-All via environment variables (defaults shown):
+Timings come directly from official `KPipeline.infer` → `output.pred_dur` →
+`KPipeline.join_timestamps`; timestamp seconds are converted to 24 kHz sample
+indices. No ASR or proportional division. The upstream algorithm allocates
+phoneme/space duration and a BOS offset; it is synthesis alignment, not a
+measurement of pronunciation or proof anybody heard the sound. A player must
+retain only tokens whose endSample passed its actual output clock, and preserve
+failure/truncation/zero-play uncertainty.
 
-| Var | Default | Meaning |
-|---|---|---|
-| `KOKORO_MODEL_ID` | `onnx-community/Kokoro-82M-v1.0-ONNX` | Hugging Face model id |
-| `KOKORO_DTYPE` | `q4` | ONNX quantization (`q4` \| `q4f16` \| `q8` \| `fp16` \| `fp32`) |
-| `KOKORO_VOICE` | `af_heart` | Default voice (warm female narrator; see `/voices` for all 28) |
-| `KOKORO_HOST` | `127.0.0.1` | Bind host |
-| `KOKORO_PORT` | `8181` | Bind port when systemd did not pass a socket |
-| `KOKORO_IDLE_TIMEOUT_MS` | `600000` | Idle time before graceful process exit (1 minute–24 hours) |
+Example from real af_heart inference of `Hello world.` at speed 1:
+`Hello: [8400,15000]`, `world: [15000,31200]`, `.: [31200,35400]`, in a
+37,800-sample waveform. These are returned model-duration alignments, not evenly
+spaced guesses. Different model/runtime versions may produce different values.
 
-Model files are cached by `kokoro-js` under `~/.cache/huggingface/transformers/`
-(XDG: `$XDG_CACHE_HOME`).
+This repository exposes alignment; it does **not** change Relay engine selection
+or its played-prefix recording. That browser/extension integration is separate.
 
-## Run
+## Runtime and deployment
 
-```bash
-git clone https://github.com/anunkai1/pi-voice-server
-cd pi-voice-server
-npm install      # model auto-downloads on first boot (~291 MB)
-npm start        # → http://127.0.0.1:8181
+Python 3.12; CPU-only Torch and dependencies are pinned in `uv.lock`. `prepare_model.py`
+stages the model config/weights and all 28 voice packs at a pinned Hugging Face
+revision into `model/`. Runtime inference uses those files; the service sets
+`HF_HUB_OFFLINE=1`. Staging tests synthesis before the immutable release switch.
+No model download is permitted/required by the sandboxed live process.
+
+```
+uv sync --frozen
+.venv/bin/python prepare_model.py
+.venv/bin/python -m unittest -v
+KOKORO_PORT=18181 HF_HUB_OFFLINE=1 .venv/bin/python server.py
+.venv/bin/python verify_contract.py http://127.0.0.1:18181
+.venv/bin/python verify_lifecycle.py
 ```
 
-Quick smoke test:
+The runtime honours systemd's inherited `tts` FD (loopback only); outside
+systemd it binds KOKORO_HOST/KOKORO_PORT, default 127.0.0.1:8181. It lazily loads
+one model, defaults to four Torch CPU threads (`KOKORO_THREADS`), and exits
+successfully after ten minutes without synthesis. Health checks do not load
+weights or extend the idle lifetime. `KOKORO_IDLE_TIMEOUT_MS` permits 60,000 to
+86,400,000; `KOKORO_VOICE` and `KOKORO_MAX_AUDIO_BYTES` remain supported.
+`KOKORO_MODEL_ID`/`KOKORO_DTYPE` are intentionally retired: Python uses the pinned
+82M fp32 model, not a different ONNX model or dtype.
 
-```bash
-curl -X POST http://127.0.0.1:8181/tts \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello world."}' \
-  --output out.wav
-```
+Deployment: `deploy-pi-voice-server`. It fetches committed GitHub main, builds an
+immutable v3 release, validates dependencies/tests and real synthesis, and uses
+the existing transactional release helpers. It restarts **only** the voice
+service/socket. ACB, KidStories, KidStories2 and Lappy tunnels do not change.
 
-## Run with systemd socket activation
+**Rollback:** `deploy-pi-voice-server --rollback-js` restores the preserved v2
+immutable kokoro-js release **and its matching service unit**, under the same
+socket. It refuses a busy/unhealthy current service, like normal deployment.
+The first cutover saves `rollback-js` and `rollback-js.service` under the release
+root; these are intentionally not pruned during this trial. No JS process runs
+alongside Python. Reapply normal deployment to return to Python. Discarding the
+on-disk rollback artefacts is a later owner decision, not part of the trial.
 
-Server2's production service and socket units are maintained in the private
-[`infra/systemd/`](https://gitea.mavali.top/admin/infra) deployment manifest.
-The socket owns `127.0.0.1:8181`, queues a request while the lightweight process
-starts, and activates the service on demand. The service accepts exactly one named
-systemd file descriptor (`tts`) and otherwise falls back to `KOKORO_HOST` /
-`KOKORO_PORT` for development and candidate smoke tests.
+## Measurements
 
-## Files
+See `benchmarks/2026-11-15/README.md` and raw JSON. Python is faster warm on the
+measured texts but slower cold and uses more memory/disk. These are Server2
+measurements, not a guarantee about perceived conversational latency.
 
-- **`server.mjs`** — the server. This is the source of truth (the systemd unit runs it).
-- `lib/lifecycle.mjs` — socket-activation and idle-shutdown lifecycle helpers.
+## Licence
 
-## Related
-
-- [agentchatbox](https://github.com/anunkai1/agentchatbox) — the chat UI that consumes this (`/api/tts` → here)
-- [pi-voice-reply](https://github.com/anunkai1/pi-voice-reply) — pi extension producing spoken-summary voice replies
-- [`@s1m0n38/pi-voice`](https://github.com/s1m0n38/pi-voice) — upstream this was adapted from (MIT)
-- [`kokoro-js`](https://www.npmjs.com/package/kokoro-js) — the Kokoro ONNX bindings
-
-## License
-
-MIT — see [LICENSE](LICENSE). Adapted from `@s1m0n38/pi-voice` (MIT).
+MIT server wrapper; Kokoro, its model, English phonemisation and Torch retain
+their upstream licences. Original server adapted from @s1m0n38/pi-voice.

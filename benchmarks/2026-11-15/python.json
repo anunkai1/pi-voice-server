@@ -1,0 +1,60 @@
+{
+  "command": [
+    ".venv/bin/python",
+    "server.py"
+  ],
+  "method": "fresh process; cached weights; af_heart speed=1; three warm requests, median; 4 Python Torch threads; no Server4",
+  "healthReadySeconds": 0.16953910900338087,
+  "coldShort": {
+    "seconds": 6.011443126997619,
+    "audioSeconds": 4.35,
+    "rtf": 1.381940948735085
+  },
+  "processToFirstWavSeconds": 6.181110918005288,
+  "short": {
+    "text": "Hello. I can speak to you while the tools keep working.",
+    "trials": [
+      {
+        "seconds": 1.2654784719998133,
+        "audioSeconds": 4.35,
+        "rtf": 0.29091459126432495
+      },
+      {
+        "seconds": 1.2536717719995067,
+        "audioSeconds": 4.35,
+        "rtf": 0.28820040735620844
+      },
+      {
+        "seconds": 1.2590850150008919,
+        "audioSeconds": 4.35,
+        "rtf": 0.2894448310346878
+      }
+    ],
+    "medianSeconds": 1.2590850150008919
+  },
+  "paragraph": {
+    "text": "The garden was quiet after the rain. A small bird landed beside the water bowl and watched the morning light move across the fence. Inside the house, someone opened a window and put the kettle on. There was no need to hurry today. We could finish the useful work first, take a short break, and come back with a clearer idea of what mattered most.",
+    "trials": [
+      {
+        "seconds": 6.727243044006173,
+        "audioSeconds": 21.375,
+        "rtf": 0.3147248207722186
+      },
+      {
+        "seconds": 6.4755114180006785,
+        "audioSeconds": 21.375,
+        "rtf": 0.302947902596523
+      },
+      {
+        "seconds": 8.296367324997846,
+        "audioSeconds": 21.375,
+        "rtf": 0.3881341438595483
+      }
+    ],
+    "medianSeconds": 6.727243044006173
+  },
+  "memory": [
+    "VmHWM:\t 1888252 kB",
+    "VmRSS:\t 1697576 kB"
+  ]
+}
