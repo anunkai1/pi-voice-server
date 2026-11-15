@@ -138,6 +138,22 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_espeak_data_is_moved_not_duplicated_at_shorter_path(self):
+        import tempfile
+        from pathlib import Path
+        from prepare_model import stage_espeak_data
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / ("nested" * 25) / "espeak-ng-data"
+            source.mkdir(parents=True)
+            (source / "phontab").write_text("fixture")
+            stage_espeak_data(root, source)
+            self.assertTrue(source.is_symlink())
+            self.assertEqual(source.resolve(), root / "espeak-ng-data")
+            self.assertEqual((source / "phontab").read_text(), "fixture")
+            stage_espeak_data(root, source)
+            self.assertEqual(len(list(root.rglob("phontab"))), 1)
+
     def test_sentence_ramp(self):
         self.assertEqual(chunks("One. Two. Three."), ["One.", "Two.", "Three."])
         self.assertEqual(chunks("Dr. Smith left. Next."), ["Dr. Smith left.", "Next."])

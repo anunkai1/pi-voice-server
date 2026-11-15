@@ -36,6 +36,8 @@ Installed-size method: `du -sb` of the existing pruned immutable JS release
 counts the system Node/Python interpreter, shared download caches or rollback
 copies. Tiny server/source files do not materially change the rounded figures.
 Python model packs include every advertised voice, not only the benchmark one.
+The packaging fix moves eSpeak's data out of `.venv` to the release root without
+copying it; count that directory too when repeating the installed-size measurement.
 
 **Conclusion:** Python was about 27% faster warm for the short text and 29%
 faster warm for the paragraph here. Its first complete WAV was about 3.2×
@@ -56,3 +58,10 @@ records synthesis with all 28 advertised voices, and `lifecycle.json` records
 inherited-FD activation and successful idle exit after the 60-second minimum.
 The original JS utility test suite passed all 17 tests before retiring the JS
 backend; the Python contract suite is now `python -m unittest -v`.
+
+An initial cutover passed pre-rename synthesis but failed live eSpeak startup
+because the final nested package path exceeded its native path-length limit.
+The explicit rollback command restored JS successfully. Packaging now moves
+that data (without duplication) to the release root and smoke-tests the final,
+read-only release path before switching. The injected post-health transaction
+failure also restored the previous JS unit/release successfully.

@@ -76,6 +76,9 @@ Torch's upstream version (the vulnerability feed does not match its `+cpu` tag);
 the hash-pinned spaCy English model is not covered by the PyPI vulnerability feed. Runtime inference uses those files; the service sets
 `HF_HUB_OFFLINE=1`. Staging tests synthesis before the immutable release switch.
 No model download is permitted/required by the sandboxed live process.
+The preparer also relocates eSpeak's data to the release root (one copy, with a
+relative symlink from site-packages), avoiding its native path-length limit.
+Deployment smoke tests run after the final rename and read-only ownership change.
 
 ```
 uv sync --frozen
