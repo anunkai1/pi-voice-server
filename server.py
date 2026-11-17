@@ -22,6 +22,10 @@ RATE = 24000
 ALIGNMENT = "kokoro-pred-dur-v1"
 
 
+class UnpronounceableText(ValueError):
+    """Input cannot be represented by the speech model without dropping text."""
+
+
 @dataclass
 class Config:
     voice: str = os.getenv("KOKORO_VOICE", "af_heart")
@@ -125,15 +129,30 @@ class KokoroBackend:
                 # over-context URL/word. Never let upstream truncate phonemes.
                 if len(chunk) < 2:
                     raise ValueError("text cannot fit Kokoro's phoneme context")
-                middle = len(chunk) // 2
-                pending[0:0] = [chunk[:middle], chunk[middle:]]
+                boundaries = [m.start() for m in re.finditer(r"\s+", chunk) if 0 < m.start() < len(chunk)]
+                middle = min(boundaries, key=lambda i: abs(i - len(chunk) // 2)) if boundaries else len(chunk) // 2
+                pending[0:0] = [chunk[:middle].strip(), chunk[middle:].strip()]
                 continue
-            for gs, ps, tks in pipeline.en_tokenize(tokens):
-                if not ps:
+            tokenized = list(pipeline.en_tokenize(tokens))
+            if not tokenized:
+                raise UnpronounceableText("text contains a chunk with no pronounceable content")
+            for gs, ps, tks in tokenized:
+                if not ps.strip():
+                    raise UnpronounceableText("text contains a chunk with no pronounceable content")
+                if len(ps) <= 510:
+                    prepared.append((gs, ps, tks))
                     continue
-                if len(ps) > 510:
-                    raise ValueError("phoneme context exceeded; refusing truncation")
-                prepared.append((gs, ps, tks))
+                # Upstream's punctuation waterfall can leave a remainder
+                # over its own 510-phoneme limit. Repack at token boundaries
+                # rather than rejecting a valid sentence or cutting a word.
+                group = []
+                for token in tks:
+                    if group and len(pipeline.tokens_to_ps([*group, token])) > 510:
+                        prepared.append((pipeline.tokens_to_text(group), pipeline.tokens_to_ps(group), group))
+                        group = []
+                    group.append(token)
+                if group and pipeline.tokens_to_ps(group):
+                    prepared.append((pipeline.tokens_to_text(group), pipeline.tokens_to_ps(group), group))
         return prepared
 
     def synthesize(self, item, voice, speed, offset):
@@ -205,6 +224,8 @@ def create_app(backend=None, config=None):
         return web.json_response({"voices": VOICES})
 
     async def tts(request):
+        if state["draining"]:
+            raise web.HTTPServiceUnavailable(text='{"error":"server is draining"}', content_type="application/json")
         try:
             body = await request.json()
         except (ValueError, UnicodeDecodeError):
@@ -228,7 +249,11 @@ def create_app(backend=None, config=None):
                     return request.transport is None or request.transport.is_closing()
                 if disconnected():
                     return response
+                if state["draining"]:
+                    raise web.HTTPServiceUnavailable(text='{"error":"server is draining"}', content_type="application/json")
                 items = await cpu(backend.prepare, text, voice)
+                if not items:
+                    raise UnpronounceableText("text contains no pronounceable content")
                 audio, offset, total = [], 0, 0 if streaming else 44
                 for item in items:
                     if disconnected():
@@ -263,7 +288,8 @@ def create_app(backend=None, config=None):
                 except ConnectionError:
                     pass
                 return response
-            return web.json_response({"error": str(error)}, status=error.status if isinstance(error, web.HTTPException) else 500)
+            status = error.status if isinstance(error, web.HTTPException) else 400 if isinstance(error, UnpronounceableText) else 500
+            return web.json_response({"error": str(error)}, status=status)
         finally:
             state["active"] -= 1
             state["last"] = time.monotonic()
@@ -282,6 +308,10 @@ def create_app(backend=None, config=None):
         await asyncio.gather(task, return_exceptions=True)
         executor.shutdown(wait=True)
 
+    async def start_draining(_):
+        state["draining"] = True
+
+    app.on_shutdown.append(start_draining)
     app.cleanup_ctx.append(lifecycle)
     app.router.add_get("/health", health)
     app.router.add_get("/voices", voices)
@@ -294,7 +324,10 @@ def listen_socket(env=os.environ):
     pid, fds = env.get("LISTEN_PID"), env.get("LISTEN_FDS")
     if pid is None and fds is None:
         return None
-    if pid != str(os.getpid()) or fds != "1":
+    # systemd activation variables belong only to the nominated process.
+    if pid != str(os.getpid()):
+        return None
+    if fds != "1":
         raise ValueError("invalid systemd socket activation environment")
     if env.get("LISTEN_FDNAMES", "tts") != "tts":
         raise ValueError("unexpected systemd socket name")
@@ -309,4 +342,4 @@ if __name__ == "__main__":
     web.run_app(create_app(), sock=inherited,
                 host=None if inherited else os.getenv("KOKORO_HOST", "127.0.0.1"),
                 port=None if inherited else int(os.getenv("KOKORO_PORT", "8181")),
-                handler_cancellation=True, shutdown_timeout=30, access_log=None)
+                handler_cancellation=True, shutdown_timeout=600, access_log=None)

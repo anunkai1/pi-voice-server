@@ -47,6 +47,7 @@ if __name__ == "__main__":
         if kind == 1:
             wav(payload)
     data, headers = request("/tts/stream", {"text": "Hello world."}, {"X-Kokoro-Alignment": "kokoro-pred-dur-v1"})
+    assert headers.get("X-Kokoro-Alignment") == "kokoro-pred-dur-v1"
     aligned = frames(data)
     assert [kind for kind, _ in aligned] == [2, 1, 0]
     metadata = json.loads(aligned[0][1])

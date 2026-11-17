@@ -4,9 +4,12 @@ import json
 import struct
 import unittest
 import wave
+import os
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from aiohttp.test_utils import TestClient, TestServer
-from server import ALIGNMENT, Config, VOICES, chunks, create_app, frame, validate, wav_bytes
+from server import ALIGNMENT, Config, VOICES, KokoroBackend, UnpronounceableText, chunks, create_app, frame, listen_socket, validate, wav_bytes
 
 
 class FakeBackend:
@@ -80,6 +83,24 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         result = frames(await response.read())
         self.assertEqual(result, [(128, b"synthesis failed")])
 
+    async def test_no_pronounceable_items_are_an_error_not_empty_audio(self):
+        backend = FakeBackend()
+        backend.prepare = lambda *_: []
+        async with TestClient(TestServer(create_app(backend))) as client:
+            response = await client.post("/tts", json={"text": "---"})
+            self.assertEqual(response.status, 400)
+            self.assertIn("pronounceable", (await response.json())["error"])
+            response = await client.post("/tts/stream", json={"text": "---"})
+            result = frames(await response.read())
+            self.assertEqual([kind for kind, _ in result], [128])
+
+    async def test_shutdown_marks_draining_before_cleanup(self):
+        await self.client.server.app.shutdown()
+        health = await (await self.client.get("/health")).json()
+        self.assertEqual(health["status"], "draining")
+        response = await self.client.post("/tts", json={"text": "Hello."})
+        self.assertEqual(response.status, 503)
+
     async def test_invalid_inputs(self):
         cases = [{}, {"text": ""}, {"text": "x", "voice": "no"}, {"text": "x", "speed": .49}, {"text": "x", "speed": 2.01}, {"text": "x", "speed": "NaN"}]
         for body in cases:
@@ -137,7 +158,83 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await (await client.get("/health")).json())["activeSyntheses"], 0)
 
 
+class BackendTests(unittest.TestCase):
+    def pipeline(self, tokens):
+        from kokoro import KPipeline
+        pipeline = object.__new__(KPipeline)
+        pipeline.g2p = lambda _: ("", tokens)
+        backend = KokoroBackend()
+        backend.model = object()  # No weights or G2P model loaded.
+        backend.pipelines = {"a": pipeline}
+        return backend
+
+    def test_real_tokenizer_overshoot_is_repacked_without_losing_words(self):
+        specifications = [(161, False), (150, False), (161, False), (1, True),
+                          (1, False), (150, False), (2, False), (1, True),
+                          (1, True), (100, False), (250, False), (161, False)]
+        tokens = [SimpleNamespace(text=f"word{i}", whitespace=" ", phonemes="," if punct else "a" * length)
+                  for i, (length, punct) in enumerate(specifications)]
+        backend = self.pipeline(tokens)
+        self.assertTrue(any(len(ps) > 510 for _, ps, _ in backend.pipelines["a"].en_tokenize(tokens)))
+        items = backend.prepare("Sentence.", "af_heart")
+        self.assertTrue(all(0 < len(ps) <= 510 for _, ps, _ in items))
+        self.assertEqual([t.text for _, _, group in items for t in group], [t.text for t in tokens])
+
+    def test_phoneme_empty_chunks_are_rejected_including_mixed_input(self):
+        backend = self.pipeline([])
+        with self.assertRaises(UnpronounceableText):
+            backend.prepare("---", "af_heart")
+        pipeline = backend.pipelines["a"]
+        pipeline.g2p = lambda text: ("", [] if text == "---" else [SimpleNamespace(text="Hello.", whitespace="", phonemes="hello")])
+        with self.assertRaises(UnpronounceableText):
+            backend.prepare("Hello.\n---", "af_heart")
+
+    def test_oversized_token_prefers_whitespace_before_character_splitting(self):
+        backend = self.pipeline([])
+        seen = []
+        def g2p(text):
+            seen.append(text)
+            # Force one oversized pass, then permit the smaller chunks.
+            return "", [SimpleNamespace(text=text, whitespace="", phonemes="x" * (511 if len(seen) == 1 else 5))]
+        backend.pipelines["a"].g2p = g2p
+        backend.prepare("alpha extraordinaryword beta", "af_heart")
+        self.assertEqual(seen[1:], ["alpha", "extraordinaryword beta"])
+
+    def test_synthesis_metadata_offsets_and_missing_tokens(self):
+        import numpy as np
+        from kokoro import KPipeline
+        tokens = [SimpleNamespace(text="Hello", whitespace=" ", start_ts=0, end_ts=.01),
+                  SimpleNamespace(text="missing", whitespace="", start_ts=None, end_ts=None)]
+        backend = self.pipeline(tokens)
+        backend.pipelines["a"].load_voice = lambda _: object()
+        audio = SimpleNamespace(detach=lambda: SimpleNamespace(cpu=lambda: SimpleNamespace(numpy=lambda: np.zeros(240))))
+        output = SimpleNamespace(audio=audio, pred_dur=object())
+        with patch.object(KPipeline, "infer", return_value=output), patch.object(KPipeline, "join_timestamps"):
+            pcm, metadata = backend.synthesize(("Hello missing", "hello", tokens), "af_heart", 1, 1000)
+        self.assertEqual(len(pcm), 480)
+        self.assertEqual((metadata["startSample"], metadata["endSample"]), (1000, 1240))
+        self.assertEqual((metadata["words"][0]["startSample"], metadata["words"][0]["endSample"]), (1000, 1240))
+        self.assertFalse(metadata["alignmentComplete"])
+        self.assertEqual(metadata["unalignedTokens"], ["missing"])
+
+
 class PureTests(unittest.TestCase):
+    def test_socket_activation_ignores_other_process_and_validates_our_descriptor(self):
+        self.assertIsNone(listen_socket({}))
+        self.assertIsNone(listen_socket({"LISTEN_PID": "99999999", "LISTEN_FDS": "1"}))
+        ours = {"LISTEN_PID": str(os.getpid()), "LISTEN_FDS": "1", "LISTEN_FDNAMES": "tts"}
+        with self.assertRaises(ValueError):
+            listen_socket({**ours, "LISTEN_FDS": "2"})
+        with self.assertRaises(ValueError):
+            listen_socket({**ours, "LISTEN_FDNAMES": "wrong"})
+        with patch("server.socket.socket") as constructor:
+            constructor.return_value.getsockname.return_value = ("127.0.0.1", 8181)
+            self.assertIs(listen_socket(ours), constructor.return_value)
+            constructor.assert_called_once_with(fileno=3)
+            constructor.return_value.getsockname.return_value = ("0.0.0.0", 8181)
+            with self.assertRaises(ValueError):
+                listen_socket(ours)
+
     def test_espeak_data_is_moved_not_duplicated_at_shorter_path(self):
         import tempfile
         from pathlib import Path
